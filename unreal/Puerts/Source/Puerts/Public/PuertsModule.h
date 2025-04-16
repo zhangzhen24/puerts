@@ -13,6 +13,8 @@
 
 #include "Modules/ModuleManager.h"
 #include "CoreMinimal.h"
+#include "JsEnv.h"
+#include "JsEnv/Private/ContainerWrapper.h"
 
 class PUERTS_API IPuertsModule : public IModuleInterface
 {
@@ -34,6 +36,8 @@ public:
     }
 #endif
 
+    virtual TSharedPtr<puerts::FJsEnv> GetJsEnv() const = 0;
+    
     virtual bool IsEnabled() = 0;
 
     virtual bool IsWatchEnabled() = 0;
