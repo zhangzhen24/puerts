@@ -125,6 +125,10 @@ public:
 
     virtual void InitExtensionMethodsMap() override;
 
+    virtual bool ExecuteAutoMixin(UClass* Class, const FString& ModulePath) override;
+
+    virtual bool ExecuteUnmixin(UClass* Class) override;
+
     void JsHotReload(FName ModuleName, const FString& JsSource);
 
     virtual void ReloadModule(FName ModuleName, const FString& JsSource) override;

@@ -32,6 +32,7 @@
 #include "ContainerMeta.h"
 
 #include "V8InspectorImpl.h"
+#include "AutoMixinListener.h"
 #if USE_WASM3
 #include "WasmModuleInstance.h"
 #endif
@@ -692,11 +693,17 @@ FJsEnvImpl::FJsEnvImpl(std::shared_ptr<IJSModuleLoader> InModuleLoader, std::sha
     auto rt = Isolate->runtime_;
     JS_SetMaxStackSize(rt, 1024 * 1024);
 #endif
+
+    // Initialize Auto Mixin listener
+    FAutoMixinListener::Get().Initialize(this);
 }
 
 // #lizard forgives
 FJsEnvImpl::~FJsEnvImpl()
 {
+    // Shutdown Auto Mixin listener
+    FAutoMixinListener::Get().Shutdown();
+
 #if USE_WASM3
     PuertsWasmRuntimeList.Empty();
     PuertsWasmEnv.reset();
@@ -981,6 +988,105 @@ void FJsEnvImpl::InitExtensionMethodsMap()
     }
 #endif
     ExtensionMethodsMapInited = true;
+}
+
+bool FJsEnvImpl::ExecuteAutoMixin(UClass* Class, const FString& ModulePath)
+{
+#ifdef SINGLE_THREAD_VERIFY
+    ensureMsgf(BoundThreadId == FPlatformTLS::GetCurrentThreadId(), TEXT("Access by illegal thread!"));
+#endif
+#ifdef THREAD_SAFE
+    v8::Locker Locker(MainIsolate);
+#endif
+    v8::Isolate::Scope IsolateScope(MainIsolate);
+    v8::HandleScope HandleScope(MainIsolate);
+    v8::Local<v8::Context> Context = DefaultContext.Get(MainIsolate);
+    v8::Context::Scope ContextScope(Context);
+
+    // Get global __executeAutoMixin function
+    v8::Local<v8::Value> FuncValue;
+    if (!Context->Global()->Get(Context,
+        FV8Utils::ToV8String(MainIsolate, "__executeAutoMixin"))
+        .ToLocal(&FuncValue) || !FuncValue->IsFunction())
+    {
+        UE_LOG(LogAutoMixin, Warning, TEXT("__executeAutoMixin not found"));
+        return false;
+    }
+
+    v8::Local<v8::Function> Func = FuncValue.As<v8::Function>();
+
+    // Get class path for JavaScript to load
+    FString ClassPath = Class->GetPathName();
+
+    // Prepare arguments: classPath (string), modulePath (string)
+    v8::Local<v8::Value> Args[2];
+    Args[0] = FV8Utils::ToV8String(MainIsolate, ClassPath);
+    Args[1] = FV8Utils::ToV8String(MainIsolate, ModulePath);
+
+    // Call function
+    v8::TryCatch TryCatch(MainIsolate);
+    v8::Local<v8::Value> Result;
+
+    if (!Func->Call(Context, Context->Global(), 2, Args).ToLocal(&Result))
+    {
+        if (TryCatch.HasCaught())
+        {
+            FString ExceptionStr = FV8Utils::TryCatchToString(MainIsolate, &TryCatch);
+            UE_LOG(LogAutoMixin, Error, TEXT("Error: %s"), *ExceptionStr);
+        }
+        return false;
+    }
+
+    return Result->IsTrue();
+}
+
+bool FJsEnvImpl::ExecuteUnmixin(UClass* Class)
+{
+#ifdef SINGLE_THREAD_VERIFY
+    ensureMsgf(BoundThreadId == FPlatformTLS::GetCurrentThreadId(), TEXT("Access by illegal thread!"));
+#endif
+#ifdef THREAD_SAFE
+    v8::Locker Locker(MainIsolate);
+#endif
+    v8::Isolate::Scope IsolateScope(MainIsolate);
+    v8::HandleScope HandleScope(MainIsolate);
+    v8::Local<v8::Context> Context = DefaultContext.Get(MainIsolate);
+    v8::Context::Scope ContextScope(Context);
+
+    // Get global __executeUnmixin function
+    v8::Local<v8::Value> FuncValue;
+    if (!Context->Global()->Get(Context,
+        FV8Utils::ToV8String(MainIsolate, "__executeUnmixin"))
+        .ToLocal(&FuncValue) || !FuncValue->IsFunction())
+    {
+        UE_LOG(LogAutoMixin, Warning, TEXT("__executeUnmixin not found"));
+        return false;
+    }
+
+    v8::Local<v8::Function> Func = FuncValue.As<v8::Function>();
+
+    // Get class path for JavaScript
+    FString ClassPath = Class->GetPathName();
+
+    // Prepare arguments: classPath (string)
+    v8::Local<v8::Value> Args[1];
+    Args[0] = FV8Utils::ToV8String(MainIsolate, ClassPath);
+
+    // Call function
+    v8::TryCatch TryCatch(MainIsolate);
+    v8::Local<v8::Value> Result;
+
+    if (!Func->Call(Context, Context->Global(), 1, Args).ToLocal(&Result))
+    {
+        if (TryCatch.HasCaught())
+        {
+            FString ExceptionStr = FV8Utils::TryCatchToString(MainIsolate, &TryCatch);
+            UE_LOG(LogAutoMixin, Error, TEXT("Unmixin Error: %s"), *ExceptionStr);
+        }
+        return false;
+    }
+
+    return Result->IsTrue();
 }
 
 std::unique_ptr<FJsEnvImpl::ObjectMerger>& FJsEnvImpl::GetObjectMerger(UStruct* Struct)
@@ -3549,6 +3655,9 @@ void FJsEnvImpl::Start(const FString& ModuleNameOrScript, const TArray<TPair<FSt
     }
 
     Started = true;
+
+    // Scan existing objects after TypeScript is initialized
+    FAutoMixinListener::Get().ScanExistingObjects();
 }
 
 bool FJsEnvImpl::LoadFile(const FString& RequiringDir, const FString& ModuleName, FString& OutPath, FString& OutDebugPath,
