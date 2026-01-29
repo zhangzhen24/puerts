@@ -53,6 +53,10 @@ public:
 
     virtual void InitExtensionMethodsMap() = 0;
 
+    virtual bool ExecuteAutoMixin(UClass* Class, const FString& ModulePath) = 0;
+
+    virtual bool ExecuteUnmixin(UClass* Class) = 0;
+
     virtual ~IJsEnv()
     {
     }
@@ -95,6 +99,10 @@ public:
     FString CurrentStackTrace();
 
     void InitExtensionMethodsMap();
+
+    bool ExecuteAutoMixin(UClass* Class, const FString& ModulePath);
+
+    bool ExecuteUnmixin(UClass* Class);
 
 private:
     std::unique_ptr<IJsEnv> GameScript;
