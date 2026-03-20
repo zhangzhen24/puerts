@@ -13,44 +13,47 @@
 
 #include "Modules/ModuleManager.h"
 #include "CoreMinimal.h"
+#include "JsEnv.h"
 
 class PUERTS_API IPuertsModule : public IModuleInterface
 {
 public:
-    static inline IPuertsModule& Get()
-    {
-        return FModuleManager::LoadModuleChecked<IPuertsModule>("Puerts");
-    }
+	static inline IPuertsModule& Get()
+	{
+		return FModuleManager::LoadModuleChecked<IPuertsModule>("Puerts");
+	}
 
-    static inline bool IsAvailable()
-    {
-        return FModuleManager::Get().IsModuleLoaded("Puerts");
-    }
+	static inline bool IsAvailable()
+	{
+		return FModuleManager::Get().IsModuleLoaded("Puerts");
+	}
 
 #if WITH_EDITOR
-    static inline bool IsInPIEMode()
-    {
-        return Get().IsInPIE();
-    }
+	static inline bool IsInPIEMode()
+	{
+		return Get().IsInPIE();
+	}
 #endif
 
-    virtual bool IsEnabled() = 0;
+	virtual TSharedPtr<puerts::FJsEnv> GetJsEnv() = 0;
 
-    virtual bool IsWatchEnabled() = 0;
+	virtual bool IsEnabled() = 0;
 
-    virtual void ReloadModule(FName ModuleName, const FString& JsSource) = 0;
+	virtual bool IsWatchEnabled() = 0;
 
-    virtual void InitExtensionMethodsMap() = 0;
+	virtual void ReloadModule(FName ModuleName, const FString& JsSource) = 0;
 
-    virtual void SetJsEnvSelector(std::function<int(UObject*, int)> InSelector) = 0;
+	virtual void InitExtensionMethodsMap() = 0;
 
-    virtual void MakeSharedJsEnv() = 0;
+	virtual void SetJsEnvSelector(std::function<int(UObject*, int)> InSelector) = 0;
 
-    virtual const TArray<FString>& GetIgnoreClassListOnDTS() = 0;
+	virtual void MakeSharedJsEnv() = 0;
 
-    virtual const TArray<FString>& GetIgnoreStructListOnDTS() = 0;
+	virtual const TArray<FString>& GetIgnoreClassListOnDTS() = 0;
+
+	virtual const TArray<FString>& GetIgnoreStructListOnDTS() = 0;
 
 #if WITH_EDITOR
-    virtual bool IsInPIE() = 0;
+	virtual bool IsInPIE() = 0;
 #endif
 };

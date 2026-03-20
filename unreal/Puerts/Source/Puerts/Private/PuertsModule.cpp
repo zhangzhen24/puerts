@@ -66,6 +66,13 @@ public:
     void Enable();
 
     void Disable();
+	
+	
+	virtual TSharedPtr<puerts::FJsEnv> IPuertsModule::GetJsEnv() override
+	{
+		return JsEnv;
+	}
+
 
     virtual bool IsEnabled() override
     {
