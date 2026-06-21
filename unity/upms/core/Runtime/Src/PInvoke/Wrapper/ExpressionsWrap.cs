@@ -71,7 +71,7 @@ namespace Puerts
 
     public static class ExpressionsWrap
     {
-        internal class NativeType
+        public class NativeType
         {
             public int typeId;
 
@@ -83,7 +83,7 @@ namespace Puerts
                 };
             }
         }
-        internal static class Helpper // 为了简化Express Tree生成复杂度的封装
+        public static class Helpper // 为了简化Express Tree生成复杂度的封装
         {
             public static T GetSelf<T>(IntPtr api, IntPtr env, IntPtr info)
             {
@@ -226,6 +226,22 @@ namespace Puerts
                 else if (t is string strValue)
                 {
                     return NativeToScript_String(apis, env, strValue);
+                }
+                else if (t is byte byteValue)
+                {
+                    return PuertsNative.pesapi_create_uint32(apis, env, byteValue);
+                }
+                else if (t is sbyte sbyteValue)
+                {
+                    return PuertsNative.pesapi_create_int32(apis, env, sbyteValue);
+                }
+                else if (t is short shortValue)
+                {
+                    return PuertsNative.pesapi_create_int32(apis, env, shortValue);
+                }
+                else if (t is ushort ushortValue)
+                {
+                    return PuertsNative.pesapi_create_uint32(apis, env, ushortValue);
                 }
                 else if (t is ScriptObject scriptObject)
                 {
@@ -541,9 +557,17 @@ namespace Puerts
             {
                 return callPApi(context.Apis, "create_int64", context.Env, value);
             }
+            else if (tranType == typeof(IntPtr))
+            {
+                return callPApi(context.Apis, "create_int64", context.Env, Expression.Convert(value, typeof(long)));
+            }
             else if (tranType == typeof(ulong))
             {
                 return callPApi(context.Apis, "create_uint64", context.Env, value);
+            }
+            else if (tranType == typeof(UIntPtr))
+            {
+                return callPApi(context.Apis, "create_uint64", context.Env, Expression.Convert(value, typeof(ulong)));
             }
             else if (tranType == typeof(double))
             {
@@ -768,9 +792,17 @@ namespace Puerts
             {
                 ret = callPApi(context.Apis, "get_value_int64", context.Env, value);
             }
+            else if (tranType == typeof(IntPtr))
+            {
+                ret = Expression.Convert(callPApi(context.Apis, "get_value_int64", context.Env, value), typeof(IntPtr));
+            }
             else if (tranType == typeof(ulong))
             {
                 ret = callPApi(context.Apis, "get_value_uint64", context.Env, value);
+            }
+            else if (tranType == typeof(UIntPtr))
+            {
+                ret = Expression.Convert(callPApi(context.Apis, "get_value_uint64", context.Env, value), typeof(UIntPtr));
             }
             else if (tranType == typeof(double))
             {
@@ -1012,7 +1044,15 @@ namespace Puerts
             {
                 return directCheckArgumentConditions(context.Apis, context.Env, value, "is_int64");
             }
+            else if (type == typeof(IntPtr))
+            {
+                return directCheckArgumentConditions(context.Apis, context.Env, value, "is_int64");
+            }
             else if (type == typeof(ulong))
+            {
+                return directCheckArgumentConditions(context.Apis, context.Env, value, "is_uint64");
+            }
+            else if (type == typeof(UIntPtr))
             {
                 return directCheckArgumentConditions(context.Apis, context.Env, value, "is_uint64");
             }
@@ -1220,10 +1260,10 @@ namespace Puerts
 
         private static bool isExtensionOf(MethodInfo methodInfo, Type type)
         {
-            return type != null && methodInfo != null && type == PuertsIl2cpp.ExtensionMethodInfo.GetExtendedType(methodInfo);
+            return type != null && methodInfo != null && type == Puerts.ExtensionMethodInfo.GetExtendedType(methodInfo);
         }
 
-        private static T BuildMethodBaseWrap<T>(Type type, MethodBase[] methodBases, bool forceCheckArgs, Func<CompileContext, MethodBase, ParameterExpression, ParameterExpression, Func<int, Expression>, Expression> buildBody)
+        private static Expression<T> BuildMethodBaseWrapExpression<T>(Type type, MethodBase[] methodBases, bool forceCheckArgs, Func<CompileContext, MethodBase, ParameterExpression, ParameterExpression, Func<int, Expression>, Expression> buildBody)
         {
             bool checkArgs = forceCheckArgs || methodBases.Length > 1;
             var methodBase0 = methodBases[0];
@@ -1374,12 +1414,17 @@ namespace Puerts
                 Expression.Catch(exVar, catchBlock)
             );
 
-            return Expression.Lambda<T>(tryCatchExpr, $"{type.Name}_m_{methodBase0.Name}", new[] { apis, info }).Compile();
+            return Expression.Lambda<T>(tryCatchExpr, $"{type.Name}_m_{methodBase0.Name}", new[] { apis, info });
         }
 
-        public static pesapi_callback BuildMethodWrap(Type type, MethodInfo[] methodInfos, bool forceCheckArgs)
+        private static T CompileMethodBaseWrap<T>(Type type, MethodBase[] methodBases, bool forceCheckArgs, Func<CompileContext, MethodBase, ParameterExpression, ParameterExpression, Func<int, Expression>, Expression> buildBody)
         {
-            return BuildMethodBaseWrap<pesapi_callback>(type, methodInfos, forceCheckArgs, (contextOutside, methodBase, info, self, getJsArg) =>
+            return BuildMethodBaseWrapExpression<T>(type, methodBases, forceCheckArgs, buildBody).Compile();
+        }
+
+        public static Expression<pesapi_callback> BuildMethodWrapExpression(Type type, MethodInfo[] methodInfos, bool forceCheckArgs)
+        {
+            return BuildMethodBaseWrapExpression<pesapi_callback>(type, methodInfos, forceCheckArgs, (contextOutside, methodBase, info, self, getJsArg) =>
             {
                 var methodInfo = methodBase as MethodInfo;
 
@@ -1437,14 +1482,24 @@ namespace Puerts
 
         }
 
-        public static pesapi_callback BuildMethodWrap(Type type, MethodInfo methodInfo, bool forceCheckArgs)
+        public static pesapi_callback BuildMethodWrap(Type type, MethodInfo[] methodInfos, bool forceCheckArgs)
         {
-            return BuildMethodWrap(type, new MethodInfo[] { methodInfo }, forceCheckArgs);
+            return BuildMethodWrapExpression(type, methodInfos, forceCheckArgs).Compile();
         }
 
-        public static pesapi_constructor BuildDelegateConstructorWrap(Type type, ConstructorInfo[] constructorInfos, bool forceCheckArgs)
+        public static Expression<pesapi_callback> BuildMethodWrapExpression(Type type, MethodInfo methodInfo, bool forceCheckArgs)
         {
-            return BuildMethodBaseWrap<pesapi_constructor>(type, constructorInfos.Take(1).ToArray(), false, (contextOutside, methodBase, info, self, getJsArg) =>
+            return BuildMethodWrapExpression(type, new MethodInfo[] { methodInfo }, forceCheckArgs);
+        }
+
+        public static pesapi_callback BuildMethodWrap(Type type, MethodInfo methodInfo, bool forceCheckArgs)
+        {
+            return BuildMethodWrapExpression(type, methodInfo, forceCheckArgs).Compile();
+        }
+
+        public static Expression<pesapi_constructor> BuildDelegateConstructorWrapExpression(Type type, ConstructorInfo[] constructorInfos, bool forceCheckArgs)
+        {
+            return BuildMethodBaseWrapExpression<pesapi_constructor>(type, constructorInfos.Take(1).ToArray(), false, (contextOutside, methodBase, info, self, getJsArg) =>
             {
                 var constructorInfo = methodBase as ConstructorInfo;
 
@@ -1475,6 +1530,11 @@ namespace Puerts
             
         }
 
+        public static pesapi_constructor BuildDelegateConstructorWrap(Type type, ConstructorInfo[] constructorInfos, bool forceCheckArgs)
+        {
+            return BuildDelegateConstructorWrapExpression(type, constructorInfos, forceCheckArgs).Compile();
+        }
+
         class DefaultStructConstructor
         {
             public DefaultStructConstructor()
@@ -1482,7 +1542,7 @@ namespace Puerts
             }
         }
 
-        public static pesapi_constructor BuildConstructorWrap(Type type, ConstructorInfo[] constructorInfos, bool forceCheckArgs)
+        public static Expression<pesapi_constructor> BuildConstructorWrapExpression(Type type, ConstructorInfo[] constructorInfos, bool forceCheckArgs)
         {
             var methodBases = constructorInfos.ToList<MethodBase>();
             if (type.IsValueType && !constructorInfos.Any(ctorInfo => ctorInfo.GetParameters().Length == 0))
@@ -1490,7 +1550,7 @@ namespace Puerts
                 methodBases.Add(typeof(DefaultStructConstructor).GetConstructor(Type.EmptyTypes)); // default constructor
             }
 
-            return BuildMethodBaseWrap<pesapi_constructor>(type, methodBases.ToArray(), forceCheckArgs, (contextOutside, methodBase, info, self, getJsArg) =>
+            return BuildMethodBaseWrapExpression<pesapi_constructor>(type, methodBases.ToArray(), forceCheckArgs, (contextOutside, methodBase, info, self, getJsArg) =>
             {
                 var constructorInfo = methodBase as ConstructorInfo;
 
@@ -1548,7 +1608,12 @@ namespace Puerts
             });
         }
 
-        public static pesapi_callback BuildFieldGetter(FieldInfo fieldInfo)
+        public static pesapi_constructor BuildConstructorWrap(Type type, ConstructorInfo[] constructorInfos, bool forceCheckArgs)
+        {
+            return BuildConstructorWrapExpression(type, constructorInfos, forceCheckArgs).Compile();
+        }
+
+        public static Expression<pesapi_callback> BuildFieldGetterExpression(FieldInfo fieldInfo)
         {
             var variables = new List<ParameterExpression>();
             var blockExpressions = new List<Expression>();
@@ -1604,10 +1669,15 @@ namespace Puerts
                 Expression.Catch(exVar, callPApi(apis, "throw_by_string", info, formatExpr))
             );
 
-            return (Expression.Lambda<pesapi_callback>(tryCatchExpr, $"{fieldInfo.DeclaringType.Name}_g_{fieldInfo.Name}", new[] { apis, info })).Compile();
+            return Expression.Lambda<pesapi_callback>(tryCatchExpr, $"{fieldInfo.DeclaringType.Name}_g_{fieldInfo.Name}", new[] { apis, info });
         }
 
-        public static pesapi_callback BuildFieldSetter(FieldInfo fieldInfo)
+        public static pesapi_callback BuildFieldGetter(FieldInfo fieldInfo)
+        {
+            return BuildFieldGetterExpression(fieldInfo).Compile();
+        }
+
+        public static Expression<pesapi_callback> BuildFieldSetterExpression(FieldInfo fieldInfo)
         {
             var variables = new List<ParameterExpression>();
             var blockExpressions = new List<Expression>();
@@ -1677,7 +1747,12 @@ namespace Puerts
                 Expression.Catch(exVar, callPApi(apis, "throw_by_string", info, formatExpr))
             );
 
-            return (Expression.Lambda<pesapi_callback>(tryCatchExpr, $"{fieldInfo.DeclaringType.Name}_s_{fieldInfo.Name}", new[] { apis, info })).Compile();
+            return Expression.Lambda<pesapi_callback>(tryCatchExpr, $"{fieldInfo.DeclaringType.Name}_s_{fieldInfo.Name}", new[] { apis, info });
+        }
+
+        public static pesapi_callback BuildFieldSetter(FieldInfo fieldInfo)
+        {
+            return BuildFieldSetterExpression(fieldInfo).Compile();
         }
 
         private static Dictionary<Type, Delegate> NativeTranlatorCache = new Dictionary<Type, Delegate>();

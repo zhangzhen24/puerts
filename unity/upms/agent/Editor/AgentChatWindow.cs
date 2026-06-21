@@ -97,11 +97,11 @@ namespace LLMAgent.Editor
         private int progressBubbleIndex = -1;
 
         /// <summary>
-        /// Accumulated progress text fragments, separated by section dividers.
+        /// Accumulated progress text fragments.
         /// </summary>
         private readonly List<string> progressFragments = new List<string>();
 
-        [MenuItem("Puerts Agent/New Chat Window")]
+        [MenuItem("PuertsEditorAssistant/New Chat")]
         public static void ShowWindow()
         {
             var window = GetWindow<AgentChatWindow>("Puerts Agent Chat");
@@ -143,7 +143,7 @@ namespace LLMAgent.Editor
                 // Auto-configure if API key is available
                 if (!string.IsNullOrEmpty(apiKey))
                 {
-                    scriptManager.ConfigureAgent(apiKey, baseURL, model);
+                    scriptManager.ConfigureAgent(apiKey, baseURL, model, 25);
                 }
                 Repaint();
             });
@@ -606,7 +606,7 @@ namespace LLMAgent.Editor
         {
             if (scriptManager != null && scriptManager.IsInitialized)
             {
-                string result = scriptManager.ConfigureAgent(apiKey, baseURL, model);
+                string result = scriptManager.ConfigureAgent(apiKey, baseURL, model, 25);
                 messages.Add(new ChatMessage
                 {
                     Text = result,
@@ -1164,11 +1164,38 @@ namespace LLMAgent.Editor
             if (progressBubbleIndex < 0 || progressBubbleIndex >= messages.Count)
                 return;
 
-            progressFragments.Add(progressText);
+            // All progress text (streaming chunks, tool calls, thinking, etc.)
+            // is appended to a single list of fragments.
+            if (!string.IsNullOrEmpty(progressText))
+            {
+                progressFragments.Add(progressText);
+            }
 
-            // Rebuild the bubble text from accumulated fragments
+            RebuildProgressBubble();
+        }
+
+        /// <summary>
+        /// Rebuild the in-progress bubble text from progress fragments.
+        /// </summary>
+        private void RebuildProgressBubble()
+        {
+            var parts = new List<string>();
+
+            // Add progress fragments (tool calls, thinking, streaming text, etc.)
+            if (progressFragments.Count > 0)
+            {
+                parts.Add(string.Join("", progressFragments));
+            }
+
             var updated = messages[progressBubbleIndex];
-            updated.Text = string.Join("\n---\n", progressFragments) + "\n\n\u23F3 Working...";
+            if (parts.Count > 0)
+            {
+                updated.Text = string.Join("\n---\n", parts) + "\n\n\u23F3 Working...";
+            }
+            else
+            {
+                updated.Text = "\u23F3 Working...";
+            }
             messages[progressBubbleIndex] = updated;
             shouldScrollToBottom = true;
             Repaint();
@@ -1180,24 +1207,23 @@ namespace LLMAgent.Editor
         private void FinalizeProgressBubble(string finalText, bool isError,
             string retryUserMessage, string retryImagePath)
         {
-            // Build the final display: progress fragments + separator + final text
+            // Build the final display: progress fragments / final text
             string combinedText;
+            var parts = new List<string>();
+
+            // Add progress fragments (tool calls, thinking, streaming text, etc.)
             if (progressFragments.Count > 0)
             {
-                string progressPart = string.Join("\n---\n", progressFragments);
-                if (!string.IsNullOrWhiteSpace(finalText))
-                {
-                    combinedText = progressPart + "\n\n" + finalText;
-                }
-                else
-                {
-                    combinedText = progressPart;
-                }
+                parts.Add(string.Join("", progressFragments));
             }
-            else
+
+            // Fall back to finalText if no fragments were collected.
+            if (parts.Count == 0 && !string.IsNullOrWhiteSpace(finalText))
             {
-                combinedText = finalText;
+                parts.Add(finalText);
             }
+
+            combinedText = parts.Count > 0 ? string.Join("", parts) : finalText;
 
             if (progressBubbleIndex >= 0 && progressBubbleIndex < messages.Count)
             {

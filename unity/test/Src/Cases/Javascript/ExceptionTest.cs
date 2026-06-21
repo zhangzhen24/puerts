@@ -427,5 +427,26 @@ namespace Puerts.UnitTest
                 ");
             }
         }
+
+#if !UNITY_WEBGL || UNITY_EDITOR
+        [Test]
+        public void DisposeTest()
+        {
+            System.GC.Collect();
+            System.GC.WaitForPendingFinalizers();
+            var jsEnv = new ScriptEnv(new Puerts.BackendV8(UnitTestEnv.GetLoader()));
+            var obj = jsEnv.Eval<ScriptObject>("{}");
+            jsEnv.Dispose();
+            //UnityEngine.Debug.Log("=======DisposeTest=========");
+            obj = null;
+            System.GC.Collect();
+            System.GC.WaitForPendingFinalizers();
+            //UnityEngine.Debug.Log("=======DisposeTest2=========");
+            Assert.Catch(() =>
+            {
+                jsEnv.Tick();
+            });
+        }
+#endif
     }
 }

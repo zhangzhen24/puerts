@@ -359,13 +359,13 @@ int pesapi_is_boolean(pesapi_env env, pesapi_value pvalue)
 int pesapi_is_int32(pesapi_env env, pesapi_value pvalue)
 {
     auto value = v8impl::V8LocalValueFromPesapiValue(pvalue);
-    return value->IsNumber();
+    return value->IsInt32();
 }
 
 int pesapi_is_uint32(pesapi_env env, pesapi_value pvalue)
 {
     auto value = v8impl::V8LocalValueFromPesapiValue(pvalue);
-    return value->IsNumber();
+    return value->IsUint32();
 }
 
 int pesapi_is_int64(pesapi_env env, pesapi_value pvalue)
@@ -692,6 +692,11 @@ void pesapi_release_value_ref(pesapi_value_ref value_ref)
     {
         if (!value_ref->env_life_cycle_tracker.expired())
         {
+            // v8::Persistent uses NonCopyablePersistentTraits (kResetInDestructor == false),
+            // so ~pesapi_value_ref__() does NOT release the strong V8 global root. Without an
+            // explicit Reset(), a JS function marshaled into a C# delegate (this path never calls
+            // pesapi_set_ref_weak) and everything its closure captures leak for the isolate's lifetime.
+            value_ref->value_persistent.Reset();
             value_ref->~pesapi_value_ref__();
         }
         ::operator delete(static_cast<void*>(value_ref));

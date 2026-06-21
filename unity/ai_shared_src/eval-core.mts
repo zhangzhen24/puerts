@@ -19,10 +19,24 @@ export let builtinSummariesText: string = '';
 
 /**
  * Get or create the eval VM.
+ * On first creation, starts a periodic Tick from the main VM to drive
+ * the eval VM's timer queue (setTimeout / setInterval).
  */
 export function getJsEnv(): CS.Puerts.ScriptEnv {
     if (!jsEnv) {
         jsEnv = CS.LLMAgent.ScriptEnvBridge.CreateJavaScriptEnv();
+
+        // Drive the eval VM's timer queue from the main VM.
+        // The main VM's setInterval is powered by EditorApplication.update,
+        // so this keeps the eval VM's setTimeout/setInterval working.
+        const envRef = jsEnv;
+        setInterval(() => {
+            try {
+                CS.LLMAgent.ScriptEnvBridge.Tick(envRef);
+            } catch (_) {
+                // Ignore tick errors to avoid crashing the main VM loop.
+            }
+        }, 20); // ~50 ticks/sec, enough for responsive timers
     }
     return jsEnv;
 }
@@ -109,17 +123,19 @@ export async function initBuiltins(): Promise<void> {
           '**IMPORTANT**: On first use of a module, read its `.description` export to see detailed function signatures. ' +
           'After that, you already know the API — just call functions directly without re-reading `.description`.\n' +
           'All functions validate their arguments at runtime and will throw errors if called with wrong parameters.\n\n' +
+          '**Examples below are illustrative only** — replace `<module-A>`, `<module-B>`, and function names ' +
+          'with the actual modules and APIs listed in "Available modules" below.\n\n' +
           'First-time usage — read description:\n' +
           '```\nasync function execute() {\n' +
-          `    const sv = await import('${builtinPath}/scene-view.mjs');\n` +
-          '    return sv.description;\n' +
+          `    const mod = await import('${builtinPath}/<module-A>.mjs');\n` +
+          '    return mod.description;\n' +
           '}\n```\n\n' +
           'After you know the API, call functions directly (you can combine MULTIPLE operations in one script):\n' +
           '```\nasync function execute() {\n' +
-          `    const sv = await import('${builtinPath}/scene-view.mjs');\n` +
-          `    const ss = await import('${builtinPath}/screenshot.mjs');\n` +
-          '    sv.focusSceneViewOn(\'Main Camera\');\n' +
-          '    return await ss.captureSceneView();\n' +
+          `    const a = await import('${builtinPath}/<module-A>.mjs');\n` +
+          `    const b = await import('${builtinPath}/<module-B>.mjs');\n` +
+          '    a.someFunction(\'arg\');\n' +
+          '    return await b.anotherFunction();\n' +
           '}\n```\n\n' +
           'Available modules:\n\n' +
           summaries.join('\n\n')
@@ -133,31 +149,13 @@ export async function initBuiltins(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 // Fixed runner code that calls the globally defined execute() function,
-// handles async result serialization and error reporting via onFinish callback.
-// If the return value is an object containing an `__image` marker (used by the
-// screenshot builtin), the image data is extracted and sent separately so that
-// the caller can convert it into multi-modal content.
+// handles async result and error reporting via onFinish callback.
+// The raw return value of execute() is passed through as-is in the result
+// field — any __image markers or serialization are handled downstream
+// by toModelOutput in eval-tool.mts.
 const RUNNER_CODE = `(function(onFinish) {
     execute().then(function(result) {
-        var resultStr;
-        var imageData = null;
-        if (result === undefined) {
-            resultStr = '(no return value)';
-        } else if (result === null) {
-            resultStr = 'null';
-        } else if (typeof result === 'object') {
-            if (result.__image && result.__image.base64) {
-                imageData = { base64: result.__image.base64, mediaType: result.__image.mediaType || 'image/png' };
-                var copy = {};
-                for (var k in result) { if (k !== '__image') copy[k] = result[k]; }
-                try { resultStr = JSON.stringify(copy, null, 2); } catch(e) { resultStr = String(result); }
-            } else {
-                try { resultStr = JSON.stringify(result, null, 2); } catch(e) { resultStr = String(result); }
-            }
-        } else {
-            resultStr = String(result);
-        }
-        onFinish.Invoke(JSON.stringify({ __error: false, result: resultStr, __image: imageData }));
+        onFinish.Invoke(JSON.stringify({ __error: false, result: result }));
     }).catch(function(err) {
         onFinish.Invoke(JSON.stringify({ __error: true, message: String(err.message || err), stack: String(err.stack || '') }));
     });
@@ -172,10 +170,9 @@ const RUNNER_CODE = `(function(onFinish) {
  */
 export interface EvalResult {
     success: boolean;
-    result?: string;
+    result?: any;
     error?: string;
     stack?: string;
-    __image?: { base64: string; mediaType: string };
 }
 
 /**
@@ -186,12 +183,15 @@ export interface EvalResult {
  * RUNNER_CODE which calls `execute()` and serialises the result.
  *
  * @param code - An async function declaration named `execute`.
+ * @param timeoutSeconds - Optional execution timeout in seconds (default 30).
+ *                         If the code does not finish within this time, a timeout
+ *                         EvalResult is returned so the caller can decide to retry.
  * @returns EvalResult with success/error info and optional image data.
  */
-export async function executeCode(code: string): Promise<EvalResult> {
+export async function executeCode(code: string, timeoutSeconds: number = 30): Promise<EvalResult> {
     const env = getJsEnv();
     try {
-        console.log(`[EvalCore] Executing code:\n${code}`);
+        console.log(`[EvalCore] Executing code (timeout=${timeoutSeconds}s):\n${code}`);
 
         // Step 1: Define the execute() function via EvalSync.
         try {
@@ -206,9 +206,23 @@ export async function executeCode(code: string): Promise<EvalResult> {
 
         // Step 2: Run the fixed runner that calls execute() and
         // serialises the result / error back through onFinish.
-        const resultJson = await new Promise<string>((resolve) => {
+        const executionPromise = new Promise<string>((resolve) => {
             CS.LLMAgent.ScriptEnvBridge.Eval(env, RUNNER_CODE, resolve);
         });
+
+        // Step 3: Race execution against a timeout.
+        const timeoutMs = timeoutSeconds * 1000;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => {
+                reject(new Error(
+                    `Execution timed out after ${timeoutSeconds}s. ` +
+                    `The code may be stuck (e.g. waiting for a resource that never resolves). ` +
+                    `You can retry with a longer timeout, simplify the code, or try a different approach.`
+                ));
+            }, timeoutMs);
+        });
+
+        const resultJson = await Promise.race([executionPromise, timeoutPromise]);
 
         const parsed = JSON.parse(resultJson);
         if (parsed.__error) {
@@ -219,15 +233,10 @@ export async function executeCode(code: string): Promise<EvalResult> {
             };
         }
 
-        // If the runner extracted image data, include it in the output
-        const output: EvalResult = {
+        return {
             success: true,
             result: parsed.result,
         };
-        if (parsed.__image) {
-            output.__image = parsed.__image;
-        }
-        return output;
     } catch (error: any) {
         const errorMsg = error.message || String(error);
         const stack = error.stack || '';

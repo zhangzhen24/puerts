@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using UnityEngine;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 namespace LLMAgent
 {
@@ -24,27 +27,26 @@ namespace LLMAgent
 
         private static readonly List<LogEntry> logBuffer = new List<LogEntry>();
         private static int maxBufferSize = 200;
-        private static bool isListening = false;
 
+#if UNITY_EDITOR
         /// <summary>
-        /// Start listening for Unity log messages.
-        /// Safe to call multiple times; will only register once.
+        /// Automatically start listening for Unity log messages when the Editor loads
+        /// or after a domain reload (e.g. script recompilation, enter/exit play mode).
+        /// No explicit call from JS/TS is needed.
         /// </summary>
-        public static void StartListening()
+        [InitializeOnLoadMethod]
+        private static void OnDomainLoad()
         {
-            if (isListening) return;
-            isListening = true;
+            Application.logMessageReceived -= OnLogMessageReceived;
             Application.logMessageReceived += OnLogMessageReceived;
-            Debug.Log("[UnityLogBridge] Started listening for Unity logs.");
         }
+#endif
 
         /// <summary>
         /// Stop listening for Unity log messages.
         /// </summary>
         public static void StopListening()
         {
-            if (!isListening) return;
-            isListening = false;
             Application.logMessageReceived -= OnLogMessageReceived;
         }
 

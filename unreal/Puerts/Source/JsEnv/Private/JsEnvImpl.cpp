@@ -557,7 +557,7 @@ FJsEnvImpl::FJsEnvImpl(std::shared_ptr<IJSModuleLoader> InModuleLoader, std::sha
 #endif
 
     MethodBindingHelper<&FJsEnvImpl::DumpStatisticsLog>::Bind(Isolate, Context, Global, "dumpStatisticsLog", This);
-
+    MethodBindingHelper<&FJsEnvImpl::IsQuickJS>::Bind(Isolate, Context, Global, "isQuickJS", This);
     Global
         ->Set(Context, FV8Utils::ToV8String(Isolate, "__tgjsFNameToArrayBuffer"),
             v8::FunctionTemplate::New(Isolate, FNameToArrayBuffer)->GetFunction(Context).ToLocalChecked())
@@ -2176,7 +2176,11 @@ static void SkipFunction(FFrame& Stack, RESULT_DECL, UFunction* Function)
     if (ReturnProp != NULL)
     {
         ReturnProp->DestroyValue(RESULT_PARAM);
+#if ENGINE_MINOR_VERSION >= 5 && ENGINE_MAJOR_VERSION >= 5
+        FMemory::Memzero(RESULT_PARAM, ReturnProp->ArrayDim * ReturnProp->GetElementSize());
+#else
         FMemory::Memzero(RESULT_PARAM, ReturnProp->ArrayDim * ReturnProp->ElementSize);
+#endif
     }
 }
 
@@ -4248,6 +4252,15 @@ void FJsEnvImpl::SetInterval(const v8::FunctionCallbackInfo<v8::Value>& Info)
     CHECK_V8_ARGS(EArgFunction, EArgNumber);
 
     SetFTickerDelegate(Info, true);
+}
+
+void FJsEnvImpl::IsQuickJS(const v8::FunctionCallbackInfo<v8::Value>& Info)
+{
+#ifdef WITH_QUICKJS
+    Info.GetReturnValue().Set(v8::Boolean::New(Info.GetIsolate(), true));
+#else
+    Info.GetReturnValue().Set(v8::Boolean::New(Info.GetIsolate(), false));
+#endif
 }
 
 #if !defined(ENGINE_INDEPENDENT_JSENV)

@@ -4,6 +4,8 @@ using BenchmarkDotNet.Running;
 using Puerts;
 using System.Diagnostics;
 
+BenchmarkRunner.Run<ScriptEnvBenchmark>();
+
 [ShortRunJob]
 [MemoryDiagnoser]
 [NativeMemoryProfiler]
@@ -39,16 +41,9 @@ public class ScriptEnvBenchmark
     }
 }
 
-public static class Program
-{
-    public static void Main(string[] args)
-    {
-        BenchmarkRunner.Run<ScriptEnvBenchmark>();
-    }
-}
-
 public class TestClass
 {
+    public static int staticValue = 42;
     public int value;
 
     public TestClass(int v)

@@ -8,6 +8,8 @@
 using Puerts;
 using System.Collections.Generic;
 using System;
+using System.IO;
+using System.Text;
 
 [Configure]
 public class WrapperGenConfig
@@ -77,6 +79,7 @@ public class WrapperGenConfig
                 typeof(Puerts.UnitTest.OptionalParametersClass),
                 typeof(Puerts.UnitTest.Timer),
                 typeof(Puerts.UnitTest.TimerTest),
+                typeof(Puerts.UnitTest.CrossLangTestHelper.LoadResource),
             };
         }
     }
@@ -87,13 +90,44 @@ public class PuerGen
 {
     public static void Main()
     {
-        Puerts.Editor.Generator.FileExporter.ExportWrapper(
-            TxtLoader.PathToBinDir("../../../Src/StaticWrapper/"),
-            new TxtLoader()
-        );
-        Puerts.Editor.Generator.FileExporter.GenRegisterInfo(
-            TxtLoader.PathToBinDir("../../../Src/StaticWrapper/"),
-            new TxtLoader()
-        );
+        var outDir = TxtLoader.PathToBinDir("../../../Src/StaticWrapper/");
+        Directory.CreateDirectory(outDir);
+
+        // Load extension methods
+        Puerts.ExtensionMethodInfo.LoadExtensionMethodInfo();
+
+        // Get binding types from configuration
+        var bindingTypes = new WrapperGenConfig();
+        var bindingsProperty = typeof(WrapperGenConfig).GetProperty("Bindings",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var types = (IEnumerable<Type>)bindingsProperty.GetValue(null, null);
+
+        var wrapperResults = new List<Puerts.StaticWrapperGenerator.TypeWrapperResult>();
+
+        foreach (var type in types)
+        {
+            try
+            {
+                var result = Puerts.StaticWrapperGenerator.GenerateWrapperForType(type);
+                wrapperResults.Add(result);
+
+                // Write wrapper file
+                string fileName = result.ClassName + ".cs";
+                string filePath = Path.Combine(outDir, fileName);
+                File.WriteAllText(filePath, result.SourceCode, Encoding.UTF8);
+                Console.WriteLine($"Generated: {fileName}");
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Failed to generate wrapper for {type.FullName}: {e.Message}");
+            }
+        }
+
+        // Generate RegisterInfo file
+        string registerInfoCode = Puerts.StaticWrapperGenerator.GenerateRegisterInfo(wrapperResults);
+        string registerInfoPath = Path.Combine(outDir, "RegisterInfo_Gen.cs");
+        File.WriteAllText(registerInfoPath, registerInfoCode, Encoding.UTF8);
+
+        Console.WriteLine($"Static wrapper generation complete: {wrapperResults.Count} types processed.");
     }
 }

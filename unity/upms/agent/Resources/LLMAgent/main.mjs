@@ -4937,20 +4937,35 @@ var TextDecoderStreamPolyfill = class {
     __name(this, "TextDecoderStreamPolyfill");
   }
   _decoder;
+  // TextDecoder | null – created lazily
+  _decoderLabel;
+  _decoderOptions;
   _transform;
   constructor(label, options) {
-    this._decoder = new TextDecoder(label, options);
+    this._decoderLabel = label;
+    this._decoderOptions = options;
+    this._decoder = null;
+    const self2 = this;
     this._transform = new TransformStream2({
       transform: /* @__PURE__ */ __name((chunk, controller) => {
-        const text2 = this._decoder.decode(chunk, { stream: true });
+        if (typeof chunk === "string") {
+          if (chunk) controller.enqueue(chunk);
+          return;
+        }
+        if (!self2._decoder) {
+          self2._decoder = new TextDecoder(self2._decoderLabel, self2._decoderOptions);
+        }
+        const text2 = self2._decoder.decode(chunk, { stream: true });
         if (text2) {
           controller.enqueue(text2);
         }
       }, "transform"),
       flush: /* @__PURE__ */ __name((controller) => {
-        const text2 = this._decoder.decode();
-        if (text2) {
-          controller.enqueue(text2);
+        if (self2._decoder) {
+          const text2 = self2._decoder.decode();
+          if (text2) {
+            controller.enqueue(text2);
+          }
         }
       }, "flush")
     });
@@ -4967,12 +4982,21 @@ var TextEncoderStreamPolyfill = class {
     __name(this, "TextEncoderStreamPolyfill");
   }
   _encoder;
+  // TextEncoder | null – created lazily
   _transform;
   constructor() {
-    this._encoder = new TextEncoder();
+    this._encoder = null;
+    const self2 = this;
     this._transform = new TransformStream2({
       transform: /* @__PURE__ */ __name((chunk, controller) => {
-        const encoded = this._encoder.encode(chunk);
+        if (chunk instanceof Uint8Array || chunk instanceof ArrayBuffer) {
+          controller.enqueue(chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk);
+          return;
+        }
+        if (!self2._encoder) {
+          self2._encoder = new TextEncoder();
+        }
+        const encoded = self2._encoder.encode(chunk);
         controller.enqueue(encoded);
       }, "transform")
     });
@@ -5044,6 +5068,33 @@ __name(installStreamsPolyfill, "installStreamsPolyfill");
 installStreamsPolyfill();
 
 // src/polyfills/fetch-polyfill.mts
+function encodeUTF8(str) {
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(str);
+  }
+  const bytes = [];
+  for (let i2 = 0; i2 < str.length; i2++) {
+    let c2 = str.charCodeAt(i2);
+    if (c2 < 128) {
+      bytes.push(c2);
+    } else if (c2 < 2048) {
+      bytes.push(192 | c2 >> 6, 128 | c2 & 63);
+    } else if (c2 >= 55296 && c2 < 56320) {
+      const next = str.charCodeAt(++i2);
+      const cp = (c2 - 55296 << 10) + (next - 56320) + 65536;
+      bytes.push(
+        240 | cp >> 18,
+        128 | cp >> 12 & 63,
+        128 | cp >> 6 & 63,
+        128 | cp & 63
+      );
+    } else {
+      bytes.push(224 | c2 >> 12, 128 | c2 >> 6 & 63, 128 | c2 & 63);
+    }
+  }
+  return new Uint8Array(bytes);
+}
+__name(encodeUTF8, "encodeUTF8");
 var FetchHeaders = class {
   static {
     __name(this, "FetchHeaders");
@@ -5115,17 +5166,31 @@ var FetchResponse = class _FetchResponse {
   }
   /**
    * Returns a ReadableStream of the body content.
-   * AI SDK uses response.body.getReader() and response.pipeThrough().
+   * AI SDK uses response.body.pipeThrough() to process SSE streams.
+   *
+   * The stream enqueues the raw string directly (not Uint8Array) because:
+   *   1. PuerTS V8 has no native TextEncoder / TextDecoder.
+   *   2. Our TextDecoderStreamPolyfill transparently passes strings through,
+   *      so the downstream EventSourceParserStream receives the text it expects.
+   *   3. This avoids a pointless encode → decode round-trip.
+   *
+   * Uses a pull-based ReadableStream so that data is only delivered
+   * when the consumer requests it, which avoids Promise scheduling
+   * issues in web-streams-polyfill when piped through TransformStream
+   * chains (TextDecoderStream → EventSourceParserStream → JSON parse).
    */
   get body() {
     if (this._body === null) {
       const text2 = this._bodyText;
-      const encoder = new TextEncoder();
-      const encoded = encoder.encode(text2);
+      let done = false;
       this._body = new ReadableStream2({
-        start(controller) {
-          controller.enqueue(encoded);
-          controller.close();
+        pull(controller) {
+          if (!done) {
+            done = true;
+            controller.enqueue(text2);
+          } else {
+            controller.close();
+          }
         }
       });
     }
@@ -5147,16 +5212,14 @@ var FetchResponse = class _FetchResponse {
   }
   async arrayBuffer() {
     this._bodyUsed = true;
-    const encoder = new TextEncoder();
-    return encoder.encode(this._bodyText).buffer;
+    return encodeUTF8(this._bodyText).buffer;
   }
   async blob() {
     const text2 = this._bodyText;
     return {
       text: /* @__PURE__ */ __name(async () => text2, "text"),
       arrayBuffer: /* @__PURE__ */ __name(async () => {
-        const encoder = new TextEncoder();
-        return encoder.encode(text2).buffer;
+        return encodeUTF8(text2).buffer;
       }, "arrayBuffer"),
       size: this._bodyText.length,
       type: this.headers.get("content-type") || ""
@@ -5172,6 +5235,91 @@ var FetchResponse = class _FetchResponse {
     );
   }
 };
+var FetchStreamResponse = class {
+  static {
+    __name(this, "FetchStreamResponse");
+  }
+  ok;
+  status;
+  statusText;
+  headers;
+  url;
+  body;
+  // ReadableStream
+  _bodyUsed = false;
+  _controller = null;
+  _fullText = "";
+  constructor(status, statusText, headers, url2) {
+    this.status = status;
+    this.statusText = statusText;
+    this.headers = headers;
+    this.url = url2;
+    this.ok = status >= 200 && status < 300;
+    const self2 = this;
+    this.body = new ReadableStream2({
+      start(controller) {
+        self2._controller = controller;
+      }
+    });
+  }
+  get bodyUsed() {
+    return this._bodyUsed;
+  }
+  /**
+   * Push a chunk of text into the body stream.
+   * Called by the fetch polyfill when C# delivers data.
+   */
+  pushChunk(text2) {
+    if (this._controller && text2) {
+      this._fullText += text2;
+      this._controller.enqueue(text2);
+    }
+  }
+  /**
+   * Signal that the stream is complete.
+   */
+  closeStream() {
+    if (this._controller) {
+      try {
+        this._controller.close();
+      } catch (_2) {
+      }
+      this._controller = null;
+    }
+  }
+  /**
+   * Signal a stream error.
+   */
+  errorStream(err) {
+    if (this._controller) {
+      try {
+        this._controller.error(err);
+      } catch (_2) {
+      }
+      this._controller = null;
+    }
+  }
+  pipeThrough(transform2, _options) {
+    return this.body.pipeThrough(transform2);
+  }
+  async text() {
+    this._bodyUsed = true;
+    return this._fullText;
+  }
+  async json() {
+    this._bodyUsed = true;
+    return JSON.parse(this._fullText);
+  }
+  async arrayBuffer() {
+    this._bodyUsed = true;
+    return encodeUTF8(this._fullText).buffer;
+  }
+};
+function isStreamRequest(body) {
+  if (!body) return false;
+  return body.includes('"stream":true') || body.includes('"stream": true');
+}
+__name(isStreamRequest, "isStreamRequest");
 async function fetchImpl(input, init) {
   let url2;
   let method = "GET";
@@ -5218,6 +5366,62 @@ async function fetchImpl(input, init) {
     throw new DOMException("The operation was aborted.", "AbortError");
   }
   const headersJson = JSON.stringify(headers);
+  const streaming = isStreamRequest(body);
+  if (streaming) {
+    return new Promise((resolve2, reject) => {
+      try {
+        console.log(`[Polyfill][Stream] request: ${body}`);
+        let streamResponse = null;
+        CS.LLMAgent.HttpBridge.SendStreamRequestAsync(
+          url2,
+          method,
+          headersJson,
+          body || "",
+          // onHeader: called once with status/headers JSON
+          (headerJson) => {
+            try {
+              console.log(`[Polyfill][Stream] headers arrived: ${headerJson}`);
+              const hdr = JSON.parse(headerJson);
+              const responseHeaders = new FetchHeaders(hdr.headers || {});
+              streamResponse = new FetchStreamResponse(
+                hdr.status || 200,
+                hdr.statusText || "OK",
+                responseHeaders,
+                url2
+              );
+              resolve2(streamResponse);
+            } catch (e2) {
+              reject(new TypeError(`Failed to parse stream headers: ${e2.message || e2}`));
+            }
+          },
+          // onChunk: called for each data chunk
+          (chunk) => {
+            if (streamResponse && chunk) {
+              streamResponse.pushChunk(chunk);
+            }
+          },
+          // onComplete: called when stream ends
+          (completionJson) => {
+            if (completionJson && completionJson.includes('"error"')) {
+              console.log(`[Polyfill][Stream] error: ${completionJson}`);
+              if (streamResponse) {
+                streamResponse.errorStream(new Error(completionJson));
+              } else {
+                reject(new TypeError(`Stream request failed: ${completionJson}`));
+              }
+            } else {
+              console.log(`[Polyfill][Stream] complete`);
+              if (streamResponse) {
+                streamResponse.closeStream();
+              }
+            }
+          }
+        );
+      } catch (error48) {
+        reject(new TypeError(`Network request failed: ${error48.message || error48}`));
+      }
+    });
+  }
   return new Promise((resolve2, reject) => {
     try {
       console.log(`[Polyfill] request: ${body}`);
@@ -24029,36 +24233,6 @@ function combineHeaders(...headers) {
   );
 }
 __name(combineHeaders, "combineHeaders");
-function createToolNameMapping({
-  tools = [],
-  providerToolNames,
-  resolveProviderToolName
-}) {
-  var _a24;
-  const customToolNameToProviderToolName = {};
-  const providerToolNameToCustomToolName = {};
-  for (const tool2 of tools) {
-    if (tool2.type === "provider") {
-      const providerToolName = (_a24 = resolveProviderToolName == null ? void 0 : resolveProviderToolName(tool2)) != null ? _a24 : tool2.id in providerToolNames ? providerToolNames[tool2.id] : void 0;
-      if (providerToolName == null) {
-        continue;
-      }
-      customToolNameToProviderToolName[tool2.name] = providerToolName;
-      providerToolNameToCustomToolName[providerToolName] = tool2.name;
-    }
-  }
-  return {
-    toProviderToolName: /* @__PURE__ */ __name((customToolName) => {
-      var _a34;
-      return (_a34 = customToolNameToProviderToolName[customToolName]) != null ? _a34 : customToolName;
-    }, "toProviderToolName"),
-    toCustomToolName: /* @__PURE__ */ __name((providerToolName) => {
-      var _a34;
-      return (_a34 = providerToolNameToCustomToolName[providerToolName]) != null ? _a34 : providerToolName;
-    }, "toCustomToolName")
-  };
-}
-__name(createToolNameMapping, "createToolNameMapping");
 async function delay(delayInMs, options) {
   if (delayInMs == null) {
     return Promise.resolve();
@@ -24089,6 +24263,54 @@ function createAbortError() {
   return new DOMException("Delay was aborted", "AbortError");
 }
 __name(createAbortError, "createAbortError");
+var DelayedPromise = class {
+  static {
+    __name(this, "DelayedPromise");
+  }
+  constructor() {
+    this.status = { type: "pending" };
+    this._resolve = void 0;
+    this._reject = void 0;
+  }
+  get promise() {
+    if (this._promise) {
+      return this._promise;
+    }
+    this._promise = new Promise((resolve2, reject) => {
+      if (this.status.type === "resolved") {
+        resolve2(this.status.value);
+      } else if (this.status.type === "rejected") {
+        reject(this.status.error);
+      }
+      this._resolve = resolve2;
+      this._reject = reject;
+    });
+    return this._promise;
+  }
+  resolve(value) {
+    var _a24;
+    this.status = { type: "resolved", value };
+    if (this._promise) {
+      (_a24 = this._resolve) == null ? void 0 : _a24.call(this, value);
+    }
+  }
+  reject(error48) {
+    var _a24;
+    this.status = { type: "rejected", error: error48 };
+    if (this._promise) {
+      (_a24 = this._reject) == null ? void 0 : _a24.call(this, error48);
+    }
+  }
+  isResolved() {
+    return this.status.type === "resolved";
+  }
+  isRejected() {
+    return this.status.type === "rejected";
+  }
+  isPending() {
+    return this.status.type === "pending";
+  }
+};
 function extractResponseHeaders(response) {
   return Object.fromEntries([...response.headers]);
 }
@@ -24558,10 +24780,6 @@ var getFromApi = /* @__PURE__ */ __name(async ({
     throw handleFetchError({ error: error48, url: url2, requestBodyValues: {} });
   }
 }, "getFromApi");
-function isNonNullable(value) {
-  return value != null;
-}
-__name(isNonNullable, "isNonNullable");
 function isUrlSupported({
   mediaType,
   url: url2,
@@ -24575,39 +24793,6 @@ function isUrlSupported({
   }).filter(({ mediaTypePrefix }) => mediaType.startsWith(mediaTypePrefix)).flatMap(({ regexes }) => regexes).some((pattern) => pattern.test(url2));
 }
 __name(isUrlSupported, "isUrlSupported");
-function loadApiKey({
-  apiKey,
-  environmentVariableName,
-  apiKeyParameterName = "apiKey",
-  description
-}) {
-  if (typeof apiKey === "string") {
-    return apiKey;
-  }
-  if (apiKey != null) {
-    throw new LoadAPIKeyError({
-      message: `${description} API key must be a string.`
-    });
-  }
-  if (typeof process === "undefined") {
-    throw new LoadAPIKeyError({
-      message: `${description} API key is missing. Pass it using the '${apiKeyParameterName}' parameter. Environment variables is not supported in this environment.`
-    });
-  }
-  apiKey = process.env[environmentVariableName];
-  if (apiKey == null) {
-    throw new LoadAPIKeyError({
-      message: `${description} API key is missing. Pass it using the '${apiKeyParameterName}' parameter or the ${environmentVariableName} environment variable.`
-    });
-  }
-  if (typeof apiKey !== "string") {
-    throw new LoadAPIKeyError({
-      message: `${description} API key must be a string. The value of the ${environmentVariableName} environment variable is not a string.`
-    });
-  }
-  return apiKey;
-}
-__name(loadApiKey, "loadApiKey");
 function loadOptionalSetting({
   settingValue,
   environmentVariableName
@@ -24625,18 +24810,6 @@ function loadOptionalSetting({
   return settingValue;
 }
 __name(loadOptionalSetting, "loadOptionalSetting");
-function mediaTypeToExtension(mediaType) {
-  var _a24;
-  const [_type, subtype = ""] = mediaType.toLowerCase().split("/");
-  return (_a24 = {
-    mpeg: "mp3",
-    "x-wav": "wav",
-    opus: "ogg",
-    mp4: "m4a",
-    "x-m4a": "m4a"
-  }[subtype]) != null ? _a24 : subtype;
-}
-__name(mediaTypeToExtension, "mediaTypeToExtension");
 var suspectProtoRx = /"(?:_|\\u005[Ff])(?:_|\\u005[Ff])(?:p|\\u0070)(?:r|\\u0072)(?:o|\\u006[Ff])(?:t|\\u0074)(?:o|\\u006[Ff])(?:_|\\u005[Ff])(?:_|\\u005[Ff])"\s*:/;
 var suspectConstructorRx = /"(?:c|\\u0063)(?:o|\\u006[Ff])(?:n|\\u006[Ee])(?:s|\\u0073)(?:t|\\u0074)(?:r|\\u0072)(?:u|\\u0075)(?:c|\\u0063)(?:t|\\u0074)(?:o|\\u006[Ff])(?:r|\\u0072)"\s*:/;
 function _parse2(text2) {
@@ -26205,34 +26378,6 @@ function tool(tool2) {
   return tool2;
 }
 __name(tool, "tool");
-function createProviderToolFactory({
-  id,
-  inputSchema
-}) {
-  return ({
-    execute,
-    outputSchema: outputSchema2,
-    needsApproval,
-    toModelOutput,
-    onInputStart,
-    onInputDelta,
-    onInputAvailable,
-    ...args
-  }) => tool({
-    type: "provider",
-    id,
-    args,
-    inputSchema,
-    outputSchema: outputSchema2,
-    execute,
-    needsApproval,
-    toModelOutput,
-    onInputStart,
-    onInputDelta,
-    onInputAvailable
-  });
-}
-__name(createProviderToolFactory, "createProviderToolFactory");
 function createProviderToolFactoryWithOutputSchema({
   id,
   inputSchema,
@@ -26361,36 +26506,6 @@ var createJsonResponseHandler = /* @__PURE__ */ __name((responseSchema) => async
     rawValue: parsedResult.rawValue
   };
 }, "createJsonResponseHandler");
-var createBinaryResponseHandler = /* @__PURE__ */ __name(() => async ({ response, url: url2, requestBodyValues }) => {
-  const responseHeaders = extractResponseHeaders(response);
-  if (!response.body) {
-    throw new APICallError({
-      message: "Response body is empty",
-      url: url2,
-      requestBodyValues,
-      statusCode: response.status,
-      responseHeaders,
-      responseBody: void 0
-    });
-  }
-  try {
-    const buffer = await response.arrayBuffer();
-    return {
-      responseHeaders,
-      value: new Uint8Array(buffer)
-    };
-  } catch (error48) {
-    throw new APICallError({
-      message: "Failed to read response as array buffer",
-      url: url2,
-      requestBodyValues,
-      statusCode: response.status,
-      responseHeaders,
-      responseBody: void 0,
-      cause: error48
-    });
-  }
-}, "createBinaryResponseHandler");
 function withoutTrailingSlash(url2) {
   return url2 == null ? void 0 : url2.replace(/\/$/, "");
 }
@@ -28126,6 +28241,24 @@ var name152 = "AI_UIMessageStreamError";
 var marker152 = `vercel.ai.error.${name152}`;
 var symbol152 = Symbol.for(marker152);
 var _a152;
+var UIMessageStreamError = class extends AISDKError {
+  static {
+    __name(this, "UIMessageStreamError");
+  }
+  constructor({
+    chunkType,
+    chunkId,
+    message
+  }) {
+    super({ name: name152, message });
+    this[_a152] = true;
+    this.chunkType = chunkType;
+    this.chunkId = chunkId;
+  }
+  static isInstance(error48) {
+    return AISDKError.hasMarker(error48, marker152);
+  }
+};
 _a152 = symbol152;
 var name162 = "AI_InvalidDataContentError";
 var marker162 = `vercel.ai.error.${name162}`;
@@ -28390,6 +28523,13 @@ function getStepTimeoutMs(timeout) {
   return timeout.stepMs;
 }
 __name(getStepTimeoutMs, "getStepTimeoutMs");
+function getChunkTimeoutMs(timeout) {
+  if (timeout == null || typeof timeout === "number") {
+    return void 0;
+  }
+  return timeout.chunkMs;
+}
+__name(getChunkTimeoutMs, "getChunkTimeoutMs");
 var imageMediaTypeSignatures = [
   {
     mediaType: "image/gif",
@@ -29703,6 +29843,24 @@ function asLanguageModelUsage(usage) {
   };
 }
 __name(asLanguageModelUsage, "asLanguageModelUsage");
+function createNullLanguageModelUsage() {
+  return {
+    inputTokens: void 0,
+    inputTokenDetails: {
+      noCacheTokens: void 0,
+      cacheReadTokens: void 0,
+      cacheWriteTokens: void 0
+    },
+    outputTokens: void 0,
+    outputTokenDetails: {
+      textTokens: void 0,
+      reasoningTokens: void 0
+    },
+    totalTokens: void 0,
+    raw: void 0
+  };
+}
+__name(createNullLanguageModelUsage, "createNullLanguageModelUsage");
 function addLanguageModelUsage(usage1, usage2) {
   var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i, _j;
   return {
@@ -30159,6 +30317,15 @@ var DefaultGeneratedFile = class {
       this.uint8ArrayData = convertBase64ToUint8Array(this.base64Data);
     }
     return this.uint8ArrayData;
+  }
+};
+var DefaultGeneratedFileWithType = class extends DefaultGeneratedFile {
+  static {
+    __name(this, "DefaultGeneratedFileWithType");
+  }
+  constructor(options) {
+    super(options);
+    this.type = "file";
   }
 };
 async function isApprovalNeeded({
@@ -32083,6 +32250,87 @@ function asContent({
   return [...contentParts, ...toolOutputs, ...toolApprovalRequests];
 }
 __name(asContent, "asContent");
+function prepareHeaders(headers, defaultHeaders) {
+  const responseHeaders = new Headers(headers != null ? headers : {});
+  for (const [key, value] of Object.entries(defaultHeaders)) {
+    if (!responseHeaders.has(key)) {
+      responseHeaders.set(key, value);
+    }
+  }
+  return responseHeaders;
+}
+__name(prepareHeaders, "prepareHeaders");
+function createTextStreamResponse({
+  status,
+  statusText,
+  headers,
+  textStream
+}) {
+  return new Response(textStream.pipeThrough(new TextEncoderStream()), {
+    status: status != null ? status : 200,
+    statusText,
+    headers: prepareHeaders(headers, {
+      "content-type": "text/plain; charset=utf-8"
+    })
+  });
+}
+__name(createTextStreamResponse, "createTextStreamResponse");
+function writeToServerResponse({
+  response,
+  status,
+  statusText,
+  headers,
+  stream
+}) {
+  const statusCode = status != null ? status : 200;
+  if (statusText !== void 0) {
+    response.writeHead(statusCode, statusText, headers);
+  } else {
+    response.writeHead(statusCode, headers);
+  }
+  const reader = stream.getReader();
+  const read = /* @__PURE__ */ __name(async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        const canContinue = response.write(value);
+        if (!canContinue) {
+          await new Promise((resolve3) => {
+            response.once("drain", resolve3);
+          });
+        }
+      }
+    } catch (error48) {
+      throw error48;
+    } finally {
+      response.end();
+    }
+  }, "read");
+  read();
+}
+__name(writeToServerResponse, "writeToServerResponse");
+function pipeTextStreamToResponse({
+  response,
+  status,
+  statusText,
+  headers,
+  textStream
+}) {
+  writeToServerResponse({
+    response,
+    status,
+    statusText,
+    headers: Object.fromEntries(
+      prepareHeaders(headers, {
+        "content-type": "text/plain; charset=utf-8"
+      }).entries()
+    ),
+    stream: textStream.pipeThrough(new TextEncoderStream())
+  });
+}
+__name(pipeTextStreamToResponse, "pipeTextStreamToResponse");
 var JsonToSseTransformStream = class extends TransformStream {
   static {
     __name(this, "JsonToSseTransformStream");
@@ -32100,6 +32348,45 @@ var JsonToSseTransformStream = class extends TransformStream {
     });
   }
 };
+var UI_MESSAGE_STREAM_HEADERS = {
+  "content-type": "text/event-stream",
+  "cache-control": "no-cache",
+  connection: "keep-alive",
+  "x-vercel-ai-ui-message-stream": "v1",
+  "x-accel-buffering": "no"
+  // disable nginx buffering
+};
+function createUIMessageStreamResponse({
+  status,
+  statusText,
+  headers,
+  stream,
+  consumeSseStream
+}) {
+  let sseStream = stream.pipeThrough(new JsonToSseTransformStream());
+  if (consumeSseStream) {
+    const [stream1, stream2] = sseStream.tee();
+    sseStream = stream1;
+    consumeSseStream({ stream: stream2 });
+  }
+  return new Response(sseStream.pipeThrough(new TextEncoderStream()), {
+    status,
+    statusText,
+    headers: prepareHeaders(headers, UI_MESSAGE_STREAM_HEADERS)
+  });
+}
+__name(createUIMessageStreamResponse, "createUIMessageStreamResponse");
+function getResponseUIMessageId({
+  originalMessages,
+  responseMessageId
+}) {
+  if (originalMessages == null) {
+    return void 0;
+  }
+  const lastMessage = originalMessages[originalMessages.length - 1];
+  return (lastMessage == null ? void 0 : lastMessage.role) === "assistant" ? lastMessage.id : typeof responseMessageId === "function" ? responseMessageId() : responseMessageId;
+}
+__name(getResponseUIMessageId, "getResponseUIMessageId");
 var uiMessageChunkSchema = lazySchema(
   () => zodSchema(
     external_exports.union([
@@ -32262,10 +32549,2832 @@ var uiMessageChunkSchema = lazySchema(
     ])
   )
 );
+function isDataUIMessageChunk(chunk) {
+  return chunk.type.startsWith("data-");
+}
+__name(isDataUIMessageChunk, "isDataUIMessageChunk");
+function isStaticToolUIPart(part) {
+  return part.type.startsWith("tool-");
+}
+__name(isStaticToolUIPart, "isStaticToolUIPart");
+function isDynamicToolUIPart(part) {
+  return part.type === "dynamic-tool";
+}
+__name(isDynamicToolUIPart, "isDynamicToolUIPart");
+function isToolUIPart(part) {
+  return isStaticToolUIPart(part) || isDynamicToolUIPart(part);
+}
+__name(isToolUIPart, "isToolUIPart");
+function getStaticToolName(part) {
+  return part.type.split("-").slice(1).join("-");
+}
+__name(getStaticToolName, "getStaticToolName");
+function createStreamingUIMessageState({
+  lastMessage,
+  messageId
+}) {
+  return {
+    message: (lastMessage == null ? void 0 : lastMessage.role) === "assistant" ? lastMessage : {
+      id: messageId,
+      metadata: void 0,
+      role: "assistant",
+      parts: []
+    },
+    activeTextParts: {},
+    activeReasoningParts: {},
+    partialToolCalls: {}
+  };
+}
+__name(createStreamingUIMessageState, "createStreamingUIMessageState");
+function processUIMessageStream({
+  stream,
+  messageMetadataSchema,
+  dataPartSchemas,
+  runUpdateMessageJob,
+  onError,
+  onToolCall,
+  onData
+}) {
+  return stream.pipeThrough(
+    new TransformStream({
+      async transform(chunk, controller) {
+        await runUpdateMessageJob(async ({ state, write }) => {
+          var _a21, _b17, _c, _d;
+          function getToolInvocation(toolCallId) {
+            const toolInvocations = state.message.parts.filter(isToolUIPart);
+            const toolInvocation = toolInvocations.find(
+              (invocation) => invocation.toolCallId === toolCallId
+            );
+            if (toolInvocation == null) {
+              throw new UIMessageStreamError({
+                chunkType: "tool-invocation",
+                chunkId: toolCallId,
+                message: `No tool invocation found for tool call ID "${toolCallId}".`
+              });
+            }
+            return toolInvocation;
+          }
+          __name(getToolInvocation, "getToolInvocation");
+          function updateToolPart(options) {
+            var _a222;
+            const part = state.message.parts.find(
+              (part2) => isStaticToolUIPart(part2) && part2.toolCallId === options.toolCallId
+            );
+            const anyOptions = options;
+            const anyPart = part;
+            if (part != null) {
+              part.state = options.state;
+              anyPart.input = anyOptions.input;
+              anyPart.output = anyOptions.output;
+              anyPart.errorText = anyOptions.errorText;
+              anyPart.rawInput = anyOptions.rawInput;
+              anyPart.preliminary = anyOptions.preliminary;
+              if (options.title !== void 0) {
+                anyPart.title = options.title;
+              }
+              anyPart.providerExecuted = (_a222 = anyOptions.providerExecuted) != null ? _a222 : part.providerExecuted;
+              if (anyOptions.providerMetadata != null) {
+                part.callProviderMetadata = anyOptions.providerMetadata;
+              }
+            } else {
+              state.message.parts.push({
+                type: `tool-${options.toolName}`,
+                toolCallId: options.toolCallId,
+                state: options.state,
+                title: options.title,
+                input: anyOptions.input,
+                output: anyOptions.output,
+                rawInput: anyOptions.rawInput,
+                errorText: anyOptions.errorText,
+                providerExecuted: anyOptions.providerExecuted,
+                preliminary: anyOptions.preliminary,
+                ...anyOptions.providerMetadata != null ? { callProviderMetadata: anyOptions.providerMetadata } : {}
+              });
+            }
+          }
+          __name(updateToolPart, "updateToolPart");
+          function updateDynamicToolPart(options) {
+            var _a222, _b23;
+            const part = state.message.parts.find(
+              (part2) => part2.type === "dynamic-tool" && part2.toolCallId === options.toolCallId
+            );
+            const anyOptions = options;
+            const anyPart = part;
+            if (part != null) {
+              part.state = options.state;
+              anyPart.toolName = options.toolName;
+              anyPart.input = anyOptions.input;
+              anyPart.output = anyOptions.output;
+              anyPart.errorText = anyOptions.errorText;
+              anyPart.rawInput = (_a222 = anyOptions.rawInput) != null ? _a222 : anyPart.rawInput;
+              anyPart.preliminary = anyOptions.preliminary;
+              if (options.title !== void 0) {
+                anyPart.title = options.title;
+              }
+              anyPart.providerExecuted = (_b23 = anyOptions.providerExecuted) != null ? _b23 : part.providerExecuted;
+              if (anyOptions.providerMetadata != null) {
+                part.callProviderMetadata = anyOptions.providerMetadata;
+              }
+            } else {
+              state.message.parts.push({
+                type: "dynamic-tool",
+                toolName: options.toolName,
+                toolCallId: options.toolCallId,
+                state: options.state,
+                input: anyOptions.input,
+                output: anyOptions.output,
+                errorText: anyOptions.errorText,
+                preliminary: anyOptions.preliminary,
+                providerExecuted: anyOptions.providerExecuted,
+                title: options.title,
+                ...anyOptions.providerMetadata != null ? { callProviderMetadata: anyOptions.providerMetadata } : {}
+              });
+            }
+          }
+          __name(updateDynamicToolPart, "updateDynamicToolPart");
+          async function updateMessageMetadata(metadata) {
+            if (metadata != null) {
+              const mergedMetadata = state.message.metadata != null ? mergeObjects(state.message.metadata, metadata) : metadata;
+              if (messageMetadataSchema != null) {
+                await validateTypes({
+                  value: mergedMetadata,
+                  schema: messageMetadataSchema,
+                  context: {
+                    field: "message.metadata",
+                    entityId: state.message.id
+                  }
+                });
+              }
+              state.message.metadata = mergedMetadata;
+            }
+          }
+          __name(updateMessageMetadata, "updateMessageMetadata");
+          switch (chunk.type) {
+            case "text-start": {
+              const textPart = {
+                type: "text",
+                text: "",
+                providerMetadata: chunk.providerMetadata,
+                state: "streaming"
+              };
+              state.activeTextParts[chunk.id] = textPart;
+              state.message.parts.push(textPart);
+              write();
+              break;
+            }
+            case "text-delta": {
+              const textPart = state.activeTextParts[chunk.id];
+              if (textPart == null) {
+                throw new UIMessageStreamError({
+                  chunkType: "text-delta",
+                  chunkId: chunk.id,
+                  message: `Received text-delta for missing text part with ID "${chunk.id}". Ensure a "text-start" chunk is sent before any "text-delta" chunks.`
+                });
+              }
+              textPart.text += chunk.delta;
+              textPart.providerMetadata = (_a21 = chunk.providerMetadata) != null ? _a21 : textPart.providerMetadata;
+              write();
+              break;
+            }
+            case "text-end": {
+              const textPart = state.activeTextParts[chunk.id];
+              if (textPart == null) {
+                throw new UIMessageStreamError({
+                  chunkType: "text-end",
+                  chunkId: chunk.id,
+                  message: `Received text-end for missing text part with ID "${chunk.id}". Ensure a "text-start" chunk is sent before any "text-end" chunks.`
+                });
+              }
+              textPart.state = "done";
+              textPart.providerMetadata = (_b17 = chunk.providerMetadata) != null ? _b17 : textPart.providerMetadata;
+              delete state.activeTextParts[chunk.id];
+              write();
+              break;
+            }
+            case "reasoning-start": {
+              const reasoningPart = {
+                type: "reasoning",
+                text: "",
+                providerMetadata: chunk.providerMetadata,
+                state: "streaming"
+              };
+              state.activeReasoningParts[chunk.id] = reasoningPart;
+              state.message.parts.push(reasoningPart);
+              write();
+              break;
+            }
+            case "reasoning-delta": {
+              const reasoningPart = state.activeReasoningParts[chunk.id];
+              if (reasoningPart == null) {
+                throw new UIMessageStreamError({
+                  chunkType: "reasoning-delta",
+                  chunkId: chunk.id,
+                  message: `Received reasoning-delta for missing reasoning part with ID "${chunk.id}". Ensure a "reasoning-start" chunk is sent before any "reasoning-delta" chunks.`
+                });
+              }
+              reasoningPart.text += chunk.delta;
+              reasoningPart.providerMetadata = (_c = chunk.providerMetadata) != null ? _c : reasoningPart.providerMetadata;
+              write();
+              break;
+            }
+            case "reasoning-end": {
+              const reasoningPart = state.activeReasoningParts[chunk.id];
+              if (reasoningPart == null) {
+                throw new UIMessageStreamError({
+                  chunkType: "reasoning-end",
+                  chunkId: chunk.id,
+                  message: `Received reasoning-end for missing reasoning part with ID "${chunk.id}". Ensure a "reasoning-start" chunk is sent before any "reasoning-end" chunks.`
+                });
+              }
+              reasoningPart.providerMetadata = (_d = chunk.providerMetadata) != null ? _d : reasoningPart.providerMetadata;
+              reasoningPart.state = "done";
+              delete state.activeReasoningParts[chunk.id];
+              write();
+              break;
+            }
+            case "file": {
+              state.message.parts.push({
+                type: "file",
+                mediaType: chunk.mediaType,
+                url: chunk.url,
+                ...chunk.providerMetadata != null ? { providerMetadata: chunk.providerMetadata } : {}
+              });
+              write();
+              break;
+            }
+            case "source-url": {
+              state.message.parts.push({
+                type: "source-url",
+                sourceId: chunk.sourceId,
+                url: chunk.url,
+                title: chunk.title,
+                providerMetadata: chunk.providerMetadata
+              });
+              write();
+              break;
+            }
+            case "source-document": {
+              state.message.parts.push({
+                type: "source-document",
+                sourceId: chunk.sourceId,
+                mediaType: chunk.mediaType,
+                title: chunk.title,
+                filename: chunk.filename,
+                providerMetadata: chunk.providerMetadata
+              });
+              write();
+              break;
+            }
+            case "tool-input-start": {
+              const toolInvocations = state.message.parts.filter(isStaticToolUIPart);
+              state.partialToolCalls[chunk.toolCallId] = {
+                text: "",
+                toolName: chunk.toolName,
+                index: toolInvocations.length,
+                dynamic: chunk.dynamic,
+                title: chunk.title
+              };
+              if (chunk.dynamic) {
+                updateDynamicToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  state: "input-streaming",
+                  input: void 0,
+                  providerExecuted: chunk.providerExecuted,
+                  title: chunk.title,
+                  providerMetadata: chunk.providerMetadata
+                });
+              } else {
+                updateToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  state: "input-streaming",
+                  input: void 0,
+                  providerExecuted: chunk.providerExecuted,
+                  title: chunk.title,
+                  providerMetadata: chunk.providerMetadata
+                });
+              }
+              write();
+              break;
+            }
+            case "tool-input-delta": {
+              const partialToolCall = state.partialToolCalls[chunk.toolCallId];
+              if (partialToolCall == null) {
+                throw new UIMessageStreamError({
+                  chunkType: "tool-input-delta",
+                  chunkId: chunk.toolCallId,
+                  message: `Received tool-input-delta for missing tool call with ID "${chunk.toolCallId}". Ensure a "tool-input-start" chunk is sent before any "tool-input-delta" chunks.`
+                });
+              }
+              partialToolCall.text += chunk.inputTextDelta;
+              const { value: partialArgs } = await parsePartialJson(
+                partialToolCall.text
+              );
+              if (partialToolCall.dynamic) {
+                updateDynamicToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: partialToolCall.toolName,
+                  state: "input-streaming",
+                  input: partialArgs,
+                  title: partialToolCall.title
+                });
+              } else {
+                updateToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: partialToolCall.toolName,
+                  state: "input-streaming",
+                  input: partialArgs,
+                  title: partialToolCall.title
+                });
+              }
+              write();
+              break;
+            }
+            case "tool-input-available": {
+              if (chunk.dynamic) {
+                updateDynamicToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  state: "input-available",
+                  input: chunk.input,
+                  providerExecuted: chunk.providerExecuted,
+                  providerMetadata: chunk.providerMetadata,
+                  title: chunk.title
+                });
+              } else {
+                updateToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  state: "input-available",
+                  input: chunk.input,
+                  providerExecuted: chunk.providerExecuted,
+                  providerMetadata: chunk.providerMetadata,
+                  title: chunk.title
+                });
+              }
+              write();
+              if (onToolCall && !chunk.providerExecuted) {
+                await onToolCall({
+                  toolCall: chunk
+                });
+              }
+              break;
+            }
+            case "tool-input-error": {
+              const existingPart = state.message.parts.filter(isToolUIPart).find((p2) => p2.toolCallId === chunk.toolCallId);
+              const isDynamic = existingPart != null ? existingPart.type === "dynamic-tool" : !!chunk.dynamic;
+              if (isDynamic) {
+                updateDynamicToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  state: "output-error",
+                  input: chunk.input,
+                  errorText: chunk.errorText,
+                  providerExecuted: chunk.providerExecuted,
+                  providerMetadata: chunk.providerMetadata
+                });
+              } else {
+                updateToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  state: "output-error",
+                  input: void 0,
+                  rawInput: chunk.input,
+                  errorText: chunk.errorText,
+                  providerExecuted: chunk.providerExecuted,
+                  providerMetadata: chunk.providerMetadata
+                });
+              }
+              write();
+              break;
+            }
+            case "tool-approval-request": {
+              const toolInvocation = getToolInvocation(chunk.toolCallId);
+              toolInvocation.state = "approval-requested";
+              toolInvocation.approval = { id: chunk.approvalId };
+              write();
+              break;
+            }
+            case "tool-output-denied": {
+              const toolInvocation = getToolInvocation(chunk.toolCallId);
+              toolInvocation.state = "output-denied";
+              write();
+              break;
+            }
+            case "tool-output-available": {
+              const toolInvocation = getToolInvocation(chunk.toolCallId);
+              if (toolInvocation.type === "dynamic-tool") {
+                updateDynamicToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: toolInvocation.toolName,
+                  state: "output-available",
+                  input: toolInvocation.input,
+                  output: chunk.output,
+                  preliminary: chunk.preliminary,
+                  providerExecuted: chunk.providerExecuted,
+                  title: toolInvocation.title
+                });
+              } else {
+                updateToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: getStaticToolName(toolInvocation),
+                  state: "output-available",
+                  input: toolInvocation.input,
+                  output: chunk.output,
+                  providerExecuted: chunk.providerExecuted,
+                  preliminary: chunk.preliminary,
+                  title: toolInvocation.title
+                });
+              }
+              write();
+              break;
+            }
+            case "tool-output-error": {
+              const toolInvocation = getToolInvocation(chunk.toolCallId);
+              if (toolInvocation.type === "dynamic-tool") {
+                updateDynamicToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: toolInvocation.toolName,
+                  state: "output-error",
+                  input: toolInvocation.input,
+                  errorText: chunk.errorText,
+                  providerExecuted: chunk.providerExecuted,
+                  title: toolInvocation.title
+                });
+              } else {
+                updateToolPart({
+                  toolCallId: chunk.toolCallId,
+                  toolName: getStaticToolName(toolInvocation),
+                  state: "output-error",
+                  input: toolInvocation.input,
+                  rawInput: toolInvocation.rawInput,
+                  errorText: chunk.errorText,
+                  providerExecuted: chunk.providerExecuted,
+                  title: toolInvocation.title
+                });
+              }
+              write();
+              break;
+            }
+            case "start-step": {
+              state.message.parts.push({ type: "step-start" });
+              break;
+            }
+            case "finish-step": {
+              state.activeTextParts = {};
+              state.activeReasoningParts = {};
+              break;
+            }
+            case "start": {
+              if (chunk.messageId != null) {
+                state.message.id = chunk.messageId;
+              }
+              await updateMessageMetadata(chunk.messageMetadata);
+              if (chunk.messageId != null || chunk.messageMetadata != null) {
+                write();
+              }
+              break;
+            }
+            case "finish": {
+              if (chunk.finishReason != null) {
+                state.finishReason = chunk.finishReason;
+              }
+              await updateMessageMetadata(chunk.messageMetadata);
+              if (chunk.messageMetadata != null) {
+                write();
+              }
+              break;
+            }
+            case "message-metadata": {
+              await updateMessageMetadata(chunk.messageMetadata);
+              if (chunk.messageMetadata != null) {
+                write();
+              }
+              break;
+            }
+            case "error": {
+              onError == null ? void 0 : onError(new Error(chunk.errorText));
+              break;
+            }
+            default: {
+              if (isDataUIMessageChunk(chunk)) {
+                if ((dataPartSchemas == null ? void 0 : dataPartSchemas[chunk.type]) != null) {
+                  const partIdx = state.message.parts.findIndex(
+                    (p2) => "id" in p2 && "data" in p2 && p2.id === chunk.id && p2.type === chunk.type
+                  );
+                  const actualPartIdx = partIdx >= 0 ? partIdx : state.message.parts.length;
+                  await validateTypes({
+                    value: chunk.data,
+                    schema: dataPartSchemas[chunk.type],
+                    context: {
+                      field: `message.parts[${actualPartIdx}].data`,
+                      entityName: chunk.type,
+                      entityId: chunk.id
+                    }
+                  });
+                }
+                const dataChunk = chunk;
+                if (dataChunk.transient) {
+                  onData == null ? void 0 : onData(dataChunk);
+                  break;
+                }
+                const existingUIPart = dataChunk.id != null ? state.message.parts.find(
+                  (chunkArg) => dataChunk.type === chunkArg.type && dataChunk.id === chunkArg.id
+                ) : void 0;
+                if (existingUIPart != null) {
+                  existingUIPart.data = dataChunk.data;
+                } else {
+                  state.message.parts.push(dataChunk);
+                }
+                onData == null ? void 0 : onData(dataChunk);
+                write();
+              }
+            }
+          }
+          controller.enqueue(chunk);
+        });
+      }
+    })
+  );
+}
+__name(processUIMessageStream, "processUIMessageStream");
+function handleUIMessageStreamFinish({
+  messageId,
+  originalMessages = [],
+  onStepFinish,
+  onFinish,
+  onError,
+  stream
+}) {
+  let lastMessage = originalMessages == null ? void 0 : originalMessages[originalMessages.length - 1];
+  if ((lastMessage == null ? void 0 : lastMessage.role) !== "assistant") {
+    lastMessage = void 0;
+  } else {
+    messageId = lastMessage.id;
+  }
+  let isAborted2 = false;
+  const idInjectedStream = stream.pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        if (chunk.type === "start") {
+          const startChunk = chunk;
+          if (startChunk.messageId == null && messageId != null) {
+            startChunk.messageId = messageId;
+          }
+        }
+        if (chunk.type === "abort") {
+          isAborted2 = true;
+        }
+        controller.enqueue(chunk);
+      }
+    })
+  );
+  if (onFinish == null && onStepFinish == null) {
+    return idInjectedStream;
+  }
+  const state = createStreamingUIMessageState({
+    lastMessage: lastMessage ? structuredClone(lastMessage) : void 0,
+    messageId: messageId != null ? messageId : ""
+    // will be overridden by the stream
+  });
+  const runUpdateMessageJob = /* @__PURE__ */ __name(async (job) => {
+    await job({ state, write: /* @__PURE__ */ __name(() => {
+    }, "write") });
+  }, "runUpdateMessageJob");
+  let finishCalled = false;
+  const callOnFinish = /* @__PURE__ */ __name(async () => {
+    if (finishCalled || !onFinish) {
+      return;
+    }
+    finishCalled = true;
+    const isContinuation = state.message.id === (lastMessage == null ? void 0 : lastMessage.id);
+    await onFinish({
+      isAborted: isAborted2,
+      isContinuation,
+      responseMessage: state.message,
+      messages: [
+        ...isContinuation ? originalMessages.slice(0, -1) : originalMessages,
+        state.message
+      ],
+      finishReason: state.finishReason
+    });
+  }, "callOnFinish");
+  const callOnStepFinish = /* @__PURE__ */ __name(async () => {
+    if (!onStepFinish) {
+      return;
+    }
+    const isContinuation = state.message.id === (lastMessage == null ? void 0 : lastMessage.id);
+    try {
+      await onStepFinish({
+        isContinuation,
+        responseMessage: structuredClone(state.message),
+        messages: [
+          ...isContinuation ? originalMessages.slice(0, -1) : originalMessages,
+          structuredClone(state.message)
+        ]
+      });
+    } catch (error48) {
+      onError(error48);
+    }
+  }, "callOnStepFinish");
+  return processUIMessageStream({
+    stream: idInjectedStream,
+    runUpdateMessageJob,
+    onError
+  }).pipeThrough(
+    new TransformStream({
+      async transform(chunk, controller) {
+        if (chunk.type === "finish-step") {
+          await callOnStepFinish();
+        }
+        controller.enqueue(chunk);
+      },
+      // @ts-expect-error cancel is still new and missing from types https://developer.mozilla.org/en-US/docs/Web/API/TransformStream#browser_compatibility
+      async cancel() {
+        await callOnFinish();
+      },
+      async flush() {
+        await callOnFinish();
+      }
+    })
+  );
+}
+__name(handleUIMessageStreamFinish, "handleUIMessageStreamFinish");
+function pipeUIMessageStreamToResponse({
+  response,
+  status,
+  statusText,
+  headers,
+  stream,
+  consumeSseStream
+}) {
+  let sseStream = stream.pipeThrough(new JsonToSseTransformStream());
+  if (consumeSseStream) {
+    const [stream1, stream2] = sseStream.tee();
+    sseStream = stream1;
+    consumeSseStream({ stream: stream2 });
+  }
+  writeToServerResponse({
+    response,
+    status,
+    statusText,
+    headers: Object.fromEntries(
+      prepareHeaders(headers, UI_MESSAGE_STREAM_HEADERS).entries()
+    ),
+    stream: sseStream.pipeThrough(new TextEncoderStream())
+  });
+}
+__name(pipeUIMessageStreamToResponse, "pipeUIMessageStreamToResponse");
+function createAsyncIterableStream(source) {
+  const stream = source.pipeThrough(new TransformStream());
+  stream[Symbol.asyncIterator] = function() {
+    const reader = this.getReader();
+    let finished = false;
+    async function cleanup(cancelStream) {
+      var _a21;
+      if (finished)
+        return;
+      finished = true;
+      try {
+        if (cancelStream) {
+          await ((_a21 = reader.cancel) == null ? void 0 : _a21.call(reader));
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch (e2) {
+        }
+      }
+    }
+    __name(cleanup, "cleanup");
+    return {
+      /**
+       * Reads the next chunk from the stream.
+       * @returns A promise resolving to the next IteratorResult.
+       */
+      async next() {
+        if (finished) {
+          return { done: true, value: void 0 };
+        }
+        const { done, value } = await reader.read();
+        if (done) {
+          await cleanup(true);
+          return { done: true, value: void 0 };
+        }
+        return { done: false, value };
+      },
+      /**
+       * May be called on early exit (e.g., break from for-await) or after completion.
+       * Ensures the stream is cancelled and resources are released.
+       * @returns A promise resolving to a completed IteratorResult.
+       */
+      async return() {
+        await cleanup(true);
+        return { done: true, value: void 0 };
+      },
+      /**
+       * Called on early exit with error.
+       * Ensures the stream is cancelled and resources are released, then rethrows the error.
+       * @param err The error to throw.
+       * @returns A promise that rejects with the provided error.
+       */
+      async throw(err) {
+        await cleanup(true);
+        throw err;
+      }
+    };
+  };
+  return stream;
+}
+__name(createAsyncIterableStream, "createAsyncIterableStream");
+async function consumeStream({
+  stream,
+  onError
+}) {
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done } = await reader.read();
+      if (done)
+        break;
+    }
+  } catch (error48) {
+    onError == null ? void 0 : onError(error48);
+  } finally {
+    reader.releaseLock();
+  }
+}
+__name(consumeStream, "consumeStream");
+function createResolvablePromise() {
+  let resolve3;
+  let reject;
+  const promise2 = new Promise((res, rej) => {
+    resolve3 = res;
+    reject = rej;
+  });
+  return {
+    promise: promise2,
+    resolve: resolve3,
+    reject
+  };
+}
+__name(createResolvablePromise, "createResolvablePromise");
+function createStitchableStream() {
+  let innerStreamReaders = [];
+  let controller = null;
+  let isClosed = false;
+  let waitForNewStream = createResolvablePromise();
+  const terminate = /* @__PURE__ */ __name(() => {
+    isClosed = true;
+    waitForNewStream.resolve();
+    innerStreamReaders.forEach((reader) => reader.cancel());
+    innerStreamReaders = [];
+    controller == null ? void 0 : controller.close();
+  }, "terminate");
+  const processPull = /* @__PURE__ */ __name(async () => {
+    if (isClosed && innerStreamReaders.length === 0) {
+      controller == null ? void 0 : controller.close();
+      return;
+    }
+    if (innerStreamReaders.length === 0) {
+      waitForNewStream = createResolvablePromise();
+      await waitForNewStream.promise;
+      return processPull();
+    }
+    try {
+      const { value, done } = await innerStreamReaders[0].read();
+      if (done) {
+        innerStreamReaders.shift();
+        if (innerStreamReaders.length === 0 && isClosed) {
+          controller == null ? void 0 : controller.close();
+        } else {
+          await processPull();
+        }
+      } else {
+        controller == null ? void 0 : controller.enqueue(value);
+      }
+    } catch (error48) {
+      controller == null ? void 0 : controller.error(error48);
+      innerStreamReaders.shift();
+      terminate();
+    }
+  }, "processPull");
+  return {
+    stream: new ReadableStream({
+      start(controllerParam) {
+        controller = controllerParam;
+      },
+      pull: processPull,
+      async cancel() {
+        for (const reader of innerStreamReaders) {
+          await reader.cancel();
+        }
+        innerStreamReaders = [];
+        isClosed = true;
+      }
+    }),
+    addStream: /* @__PURE__ */ __name((innerStream) => {
+      if (isClosed) {
+        throw new Error("Cannot add inner stream: outer stream is closed");
+      }
+      innerStreamReaders.push(innerStream.getReader());
+      waitForNewStream.resolve();
+    }, "addStream"),
+    /**
+     * Gracefully close the outer stream. This will let the inner streams
+     * finish processing and then close the outer stream.
+     */
+    close: /* @__PURE__ */ __name(() => {
+      isClosed = true;
+      waitForNewStream.resolve();
+      if (innerStreamReaders.length === 0) {
+        controller == null ? void 0 : controller.close();
+      }
+    }, "close"),
+    /**
+     * Immediately close the outer stream. This will cancel all inner streams
+     * and close the outer stream.
+     */
+    terminate
+  };
+}
+__name(createStitchableStream, "createStitchableStream");
+function runToolsTransformation({
+  tools,
+  generatorStream,
+  tracer,
+  telemetry,
+  system,
+  messages,
+  abortSignal,
+  repairToolCall,
+  experimental_context,
+  generateId: generateId2,
+  stepNumber,
+  model,
+  onToolCallStart,
+  onToolCallFinish
+}) {
+  let toolResultsStreamController = null;
+  const toolResultsStream = new ReadableStream({
+    start(controller) {
+      toolResultsStreamController = controller;
+    }
+  });
+  const outstandingToolResults = /* @__PURE__ */ new Set();
+  const toolInputs = /* @__PURE__ */ new Map();
+  const toolCallsByToolCallId = /* @__PURE__ */ new Map();
+  let canClose = false;
+  let finishChunk = void 0;
+  function attemptClose() {
+    if (canClose && outstandingToolResults.size === 0) {
+      if (finishChunk != null) {
+        toolResultsStreamController.enqueue(finishChunk);
+      }
+      toolResultsStreamController.close();
+    }
+  }
+  __name(attemptClose, "attemptClose");
+  const forwardStream = new TransformStream({
+    async transform(chunk, controller) {
+      const chunkType = chunk.type;
+      switch (chunkType) {
+        case "stream-start":
+        case "text-start":
+        case "text-delta":
+        case "text-end":
+        case "reasoning-start":
+        case "reasoning-delta":
+        case "reasoning-end":
+        case "tool-input-start":
+        case "tool-input-delta":
+        case "tool-input-end":
+        case "source":
+        case "response-metadata":
+        case "error":
+        case "raw": {
+          controller.enqueue(chunk);
+          break;
+        }
+        case "file": {
+          controller.enqueue({
+            type: "file",
+            file: new DefaultGeneratedFileWithType({
+              data: chunk.data,
+              mediaType: chunk.mediaType
+            }),
+            ...chunk.providerMetadata != null ? { providerMetadata: chunk.providerMetadata } : {}
+          });
+          break;
+        }
+        case "finish": {
+          finishChunk = {
+            type: "finish",
+            finishReason: chunk.finishReason.unified,
+            rawFinishReason: chunk.finishReason.raw,
+            usage: asLanguageModelUsage(chunk.usage),
+            providerMetadata: chunk.providerMetadata
+          };
+          break;
+        }
+        case "tool-approval-request": {
+          const toolCall = toolCallsByToolCallId.get(chunk.toolCallId);
+          if (toolCall == null) {
+            toolResultsStreamController.enqueue({
+              type: "error",
+              error: new ToolCallNotFoundForApprovalError({
+                toolCallId: chunk.toolCallId,
+                approvalId: chunk.approvalId
+              })
+            });
+            break;
+          }
+          controller.enqueue({
+            type: "tool-approval-request",
+            approvalId: chunk.approvalId,
+            toolCall
+          });
+          break;
+        }
+        case "tool-call": {
+          try {
+            const toolCall = await parseToolCall({
+              toolCall: chunk,
+              tools,
+              repairToolCall,
+              system,
+              messages
+            });
+            toolCallsByToolCallId.set(toolCall.toolCallId, toolCall);
+            controller.enqueue(toolCall);
+            if (toolCall.invalid) {
+              toolResultsStreamController.enqueue({
+                type: "tool-error",
+                toolCallId: toolCall.toolCallId,
+                toolName: toolCall.toolName,
+                input: toolCall.input,
+                error: getErrorMessage2(toolCall.error),
+                dynamic: true,
+                title: toolCall.title
+              });
+              break;
+            }
+            const tool2 = tools == null ? void 0 : tools[toolCall.toolName];
+            if (tool2 == null) {
+              break;
+            }
+            if (tool2.onInputAvailable != null) {
+              await tool2.onInputAvailable({
+                input: toolCall.input,
+                toolCallId: toolCall.toolCallId,
+                messages,
+                abortSignal,
+                experimental_context
+              });
+            }
+            if (await isApprovalNeeded({
+              tool: tool2,
+              toolCall,
+              messages,
+              experimental_context
+            })) {
+              toolResultsStreamController.enqueue({
+                type: "tool-approval-request",
+                approvalId: generateId2(),
+                toolCall
+              });
+              break;
+            }
+            toolInputs.set(toolCall.toolCallId, toolCall.input);
+            if (tool2.execute != null && toolCall.providerExecuted !== true) {
+              const toolExecutionId = generateId2();
+              outstandingToolResults.add(toolExecutionId);
+              executeToolCall({
+                toolCall,
+                tools,
+                tracer,
+                telemetry,
+                messages,
+                abortSignal,
+                experimental_context,
+                stepNumber,
+                model,
+                onToolCallStart,
+                onToolCallFinish,
+                onPreliminaryToolResult: /* @__PURE__ */ __name((result) => {
+                  toolResultsStreamController.enqueue(result);
+                }, "onPreliminaryToolResult")
+              }).then((result) => {
+                toolResultsStreamController.enqueue(result);
+              }).catch((error48) => {
+                toolResultsStreamController.enqueue({
+                  type: "error",
+                  error: error48
+                });
+              }).finally(() => {
+                outstandingToolResults.delete(toolExecutionId);
+                attemptClose();
+              });
+            }
+          } catch (error48) {
+            toolResultsStreamController.enqueue({ type: "error", error: error48 });
+          }
+          break;
+        }
+        case "tool-result": {
+          const toolName = chunk.toolName;
+          if (chunk.isError) {
+            toolResultsStreamController.enqueue({
+              type: "tool-error",
+              toolCallId: chunk.toolCallId,
+              toolName,
+              input: toolInputs.get(chunk.toolCallId),
+              providerExecuted: true,
+              error: chunk.result,
+              dynamic: chunk.dynamic
+            });
+          } else {
+            controller.enqueue({
+              type: "tool-result",
+              toolCallId: chunk.toolCallId,
+              toolName,
+              input: toolInputs.get(chunk.toolCallId),
+              output: chunk.result,
+              providerExecuted: true,
+              dynamic: chunk.dynamic
+            });
+          }
+          break;
+        }
+        default: {
+          const _exhaustiveCheck = chunkType;
+          throw new Error(`Unhandled chunk type: ${_exhaustiveCheck}`);
+        }
+      }
+    },
+    flush() {
+      canClose = true;
+      attemptClose();
+    }
+  });
+  return new ReadableStream({
+    async start(controller) {
+      return Promise.all([
+        generatorStream.pipeThrough(forwardStream).pipeTo(
+          new WritableStream({
+            write(chunk) {
+              controller.enqueue(chunk);
+            },
+            close() {
+            }
+          })
+        ),
+        toolResultsStream.pipeTo(
+          new WritableStream({
+            write(chunk) {
+              controller.enqueue(chunk);
+            },
+            close() {
+              controller.close();
+            }
+          })
+        )
+      ]);
+    }
+  });
+}
+__name(runToolsTransformation, "runToolsTransformation");
 var originalGenerateId2 = createIdGenerator({
   prefix: "aitxt",
   size: 24
 });
+function streamText({
+  model,
+  tools,
+  toolChoice,
+  system,
+  prompt,
+  messages,
+  maxRetries,
+  abortSignal,
+  timeout,
+  headers,
+  stopWhen = stepCountIs(1),
+  experimental_output,
+  output = experimental_output,
+  experimental_telemetry: telemetry,
+  prepareStep,
+  providerOptions,
+  experimental_activeTools,
+  activeTools = experimental_activeTools,
+  experimental_repairToolCall: repairToolCall,
+  experimental_transform: transform2,
+  experimental_download: download2,
+  includeRawChunks = false,
+  onChunk,
+  onError = /* @__PURE__ */ __name(({ error: error48 }) => {
+    console.error(error48);
+  }, "onError"),
+  onFinish,
+  onAbort,
+  onStepFinish,
+  experimental_onStart: onStart,
+  experimental_onStepStart: onStepStart,
+  experimental_onToolCallStart: onToolCallStart,
+  experimental_onToolCallFinish: onToolCallFinish,
+  experimental_context,
+  experimental_include: include,
+  _internal: { now: now2 = now, generateId: generateId2 = originalGenerateId2 } = {},
+  ...settings
+}) {
+  const totalTimeoutMs = getTotalTimeoutMs(timeout);
+  const stepTimeoutMs = getStepTimeoutMs(timeout);
+  const chunkTimeoutMs = getChunkTimeoutMs(timeout);
+  const stepAbortController = stepTimeoutMs != null ? new AbortController() : void 0;
+  const chunkAbortController = chunkTimeoutMs != null ? new AbortController() : void 0;
+  return new DefaultStreamTextResult({
+    model: resolveLanguageModel(model),
+    telemetry,
+    headers,
+    settings,
+    maxRetries,
+    abortSignal: mergeAbortSignals(
+      abortSignal,
+      totalTimeoutMs != null ? AbortSignal.timeout(totalTimeoutMs) : void 0,
+      stepAbortController == null ? void 0 : stepAbortController.signal,
+      chunkAbortController == null ? void 0 : chunkAbortController.signal
+    ),
+    stepTimeoutMs,
+    stepAbortController,
+    chunkTimeoutMs,
+    chunkAbortController,
+    system,
+    prompt,
+    messages,
+    tools,
+    toolChoice,
+    transforms: asArray(transform2),
+    activeTools,
+    repairToolCall,
+    stopConditions: asArray(stopWhen),
+    output,
+    providerOptions,
+    prepareStep,
+    includeRawChunks,
+    timeout,
+    stopWhen,
+    originalAbortSignal: abortSignal,
+    onChunk,
+    onError,
+    onFinish,
+    onAbort,
+    onStepFinish,
+    onStart,
+    onStepStart,
+    onToolCallStart,
+    onToolCallFinish,
+    now: now2,
+    generateId: generateId2,
+    experimental_context,
+    download: download2,
+    include
+  });
+}
+__name(streamText, "streamText");
+function createOutputTransformStream(output) {
+  let firstTextChunkId = void 0;
+  let text2 = "";
+  let textChunk = "";
+  let textProviderMetadata = void 0;
+  let lastPublishedJson = "";
+  function publishTextChunk({
+    controller,
+    partialOutput = void 0
+  }) {
+    controller.enqueue({
+      part: {
+        type: "text-delta",
+        id: firstTextChunkId,
+        text: textChunk,
+        providerMetadata: textProviderMetadata
+      },
+      partialOutput
+    });
+    textChunk = "";
+  }
+  __name(publishTextChunk, "publishTextChunk");
+  return new TransformStream({
+    async transform(chunk, controller) {
+      var _a21;
+      if (chunk.type === "finish-step" && textChunk.length > 0) {
+        publishTextChunk({ controller });
+      }
+      if (chunk.type !== "text-delta" && chunk.type !== "text-start" && chunk.type !== "text-end") {
+        controller.enqueue({ part: chunk, partialOutput: void 0 });
+        return;
+      }
+      if (firstTextChunkId == null) {
+        firstTextChunkId = chunk.id;
+      } else if (chunk.id !== firstTextChunkId) {
+        controller.enqueue({ part: chunk, partialOutput: void 0 });
+        return;
+      }
+      if (chunk.type === "text-start") {
+        controller.enqueue({ part: chunk, partialOutput: void 0 });
+        return;
+      }
+      if (chunk.type === "text-end") {
+        if (textChunk.length > 0) {
+          publishTextChunk({ controller });
+        }
+        controller.enqueue({ part: chunk, partialOutput: void 0 });
+        return;
+      }
+      text2 += chunk.text;
+      textChunk += chunk.text;
+      textProviderMetadata = (_a21 = chunk.providerMetadata) != null ? _a21 : textProviderMetadata;
+      const result = await output.parsePartialOutput({ text: text2 });
+      if (result !== void 0) {
+        const currentJson = JSON.stringify(result.partial);
+        if (currentJson !== lastPublishedJson) {
+          publishTextChunk({ controller, partialOutput: result.partial });
+          lastPublishedJson = currentJson;
+        }
+      }
+    }
+  });
+}
+__name(createOutputTransformStream, "createOutputTransformStream");
+var DefaultStreamTextResult = class {
+  static {
+    __name(this, "DefaultStreamTextResult");
+  }
+  constructor({
+    model,
+    telemetry,
+    headers,
+    settings,
+    maxRetries: maxRetriesArg,
+    abortSignal,
+    stepTimeoutMs,
+    stepAbortController,
+    chunkTimeoutMs,
+    chunkAbortController,
+    system,
+    prompt,
+    messages,
+    tools,
+    toolChoice,
+    transforms,
+    activeTools,
+    repairToolCall,
+    stopConditions,
+    output,
+    providerOptions,
+    prepareStep,
+    includeRawChunks,
+    now: now2,
+    generateId: generateId2,
+    timeout,
+    stopWhen,
+    originalAbortSignal,
+    onChunk,
+    onError,
+    onFinish,
+    onAbort,
+    onStepFinish,
+    onStart,
+    onStepStart,
+    onToolCallStart,
+    onToolCallFinish,
+    experimental_context,
+    download: download2,
+    include
+  }) {
+    this._totalUsage = new DelayedPromise();
+    this._finishReason = new DelayedPromise();
+    this._rawFinishReason = new DelayedPromise();
+    this._steps = new DelayedPromise();
+    this.outputSpecification = output;
+    this.includeRawChunks = includeRawChunks;
+    this.tools = tools;
+    const createGlobalTelemetry = getGlobalTelemetryIntegration();
+    const globalTelemetry = createGlobalTelemetry(telemetry == null ? void 0 : telemetry.integrations);
+    let stepFinish;
+    let recordedContent = [];
+    const recordedResponseMessages = [];
+    let recordedFinishReason = void 0;
+    let recordedRawFinishReason = void 0;
+    let recordedTotalUsage = void 0;
+    let recordedRequest = {};
+    let recordedWarnings = [];
+    const recordedSteps = [];
+    const pendingDeferredToolCalls = /* @__PURE__ */ new Map();
+    let rootSpan;
+    let activeTextContent = {};
+    let activeReasoningContent = {};
+    const eventProcessor = new TransformStream({
+      async transform(chunk, controller) {
+        var _a21, _b17, _c, _d;
+        controller.enqueue(chunk);
+        const { part } = chunk;
+        if (part.type === "text-delta" || part.type === "reasoning-delta" || part.type === "source" || part.type === "tool-call" || part.type === "tool-result" || part.type === "tool-input-start" || part.type === "tool-input-delta" || part.type === "raw") {
+          await (onChunk == null ? void 0 : onChunk({ chunk: part }));
+        }
+        if (part.type === "error") {
+          await onError({ error: wrapGatewayError(part.error) });
+        }
+        if (part.type === "text-start") {
+          activeTextContent[part.id] = {
+            type: "text",
+            text: "",
+            providerMetadata: part.providerMetadata
+          };
+          recordedContent.push(activeTextContent[part.id]);
+        }
+        if (part.type === "text-delta") {
+          const activeText = activeTextContent[part.id];
+          if (activeText == null) {
+            controller.enqueue({
+              part: {
+                type: "error",
+                error: `text part ${part.id} not found`
+              },
+              partialOutput: void 0
+            });
+            return;
+          }
+          activeText.text += part.text;
+          activeText.providerMetadata = (_a21 = part.providerMetadata) != null ? _a21 : activeText.providerMetadata;
+        }
+        if (part.type === "text-end") {
+          const activeText = activeTextContent[part.id];
+          if (activeText == null) {
+            controller.enqueue({
+              part: {
+                type: "error",
+                error: `text part ${part.id} not found`
+              },
+              partialOutput: void 0
+            });
+            return;
+          }
+          activeText.providerMetadata = (_b17 = part.providerMetadata) != null ? _b17 : activeText.providerMetadata;
+          delete activeTextContent[part.id];
+        }
+        if (part.type === "reasoning-start") {
+          activeReasoningContent[part.id] = {
+            type: "reasoning",
+            text: "",
+            providerMetadata: part.providerMetadata
+          };
+          recordedContent.push(activeReasoningContent[part.id]);
+        }
+        if (part.type === "reasoning-delta") {
+          const activeReasoning = activeReasoningContent[part.id];
+          if (activeReasoning == null) {
+            controller.enqueue({
+              part: {
+                type: "error",
+                error: `reasoning part ${part.id} not found`
+              },
+              partialOutput: void 0
+            });
+            return;
+          }
+          activeReasoning.text += part.text;
+          activeReasoning.providerMetadata = (_c = part.providerMetadata) != null ? _c : activeReasoning.providerMetadata;
+        }
+        if (part.type === "reasoning-end") {
+          const activeReasoning = activeReasoningContent[part.id];
+          if (activeReasoning == null) {
+            controller.enqueue({
+              part: {
+                type: "error",
+                error: `reasoning part ${part.id} not found`
+              },
+              partialOutput: void 0
+            });
+            return;
+          }
+          activeReasoning.providerMetadata = (_d = part.providerMetadata) != null ? _d : activeReasoning.providerMetadata;
+          delete activeReasoningContent[part.id];
+        }
+        if (part.type === "file") {
+          recordedContent.push({
+            type: "file",
+            file: part.file,
+            ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+          });
+        }
+        if (part.type === "source") {
+          recordedContent.push(part);
+        }
+        if (part.type === "tool-call") {
+          recordedContent.push(part);
+        }
+        if (part.type === "tool-result" && !part.preliminary) {
+          recordedContent.push(part);
+        }
+        if (part.type === "tool-approval-request") {
+          recordedContent.push(part);
+        }
+        if (part.type === "tool-error") {
+          recordedContent.push(part);
+        }
+        if (part.type === "start-step") {
+          recordedContent = [];
+          activeReasoningContent = {};
+          activeTextContent = {};
+          recordedRequest = part.request;
+          recordedWarnings = part.warnings;
+        }
+        if (part.type === "finish-step") {
+          const stepMessages = await toResponseMessages({
+            content: recordedContent,
+            tools
+          });
+          const currentStepResult = new DefaultStepResult({
+            stepNumber: recordedSteps.length,
+            model: modelInfo,
+            ...callbackTelemetryProps,
+            experimental_context,
+            content: recordedContent,
+            finishReason: part.finishReason,
+            rawFinishReason: part.rawFinishReason,
+            usage: part.usage,
+            warnings: recordedWarnings,
+            request: recordedRequest,
+            response: {
+              ...part.response,
+              messages: [...recordedResponseMessages, ...stepMessages]
+            },
+            providerMetadata: part.providerMetadata
+          });
+          await notify({
+            event: currentStepResult,
+            callbacks: [onStepFinish, globalTelemetry.onStepFinish]
+          });
+          logWarnings({
+            warnings: recordedWarnings,
+            provider: modelInfo.provider,
+            model: modelInfo.modelId
+          });
+          recordedSteps.push(currentStepResult);
+          recordedResponseMessages.push(...stepMessages);
+          stepFinish.resolve();
+        }
+        if (part.type === "finish") {
+          recordedTotalUsage = part.totalUsage;
+          recordedFinishReason = part.finishReason;
+          recordedRawFinishReason = part.rawFinishReason;
+        }
+      },
+      async flush(controller) {
+        try {
+          if (recordedSteps.length === 0) {
+            const error48 = (abortSignal == null ? void 0 : abortSignal.aborted) ? abortSignal.reason : new NoOutputGeneratedError({
+              message: "No output generated. Check the stream for errors."
+            });
+            self2._finishReason.reject(error48);
+            self2._rawFinishReason.reject(error48);
+            self2._totalUsage.reject(error48);
+            self2._steps.reject(error48);
+            return;
+          }
+          const finishReason = recordedFinishReason != null ? recordedFinishReason : "other";
+          const totalUsage = recordedTotalUsage != null ? recordedTotalUsage : createNullLanguageModelUsage();
+          self2._finishReason.resolve(finishReason);
+          self2._rawFinishReason.resolve(recordedRawFinishReason);
+          self2._totalUsage.resolve(totalUsage);
+          self2._steps.resolve(recordedSteps);
+          const finalStep = recordedSteps[recordedSteps.length - 1];
+          await notify({
+            event: {
+              stepNumber: finalStep.stepNumber,
+              model: finalStep.model,
+              functionId: finalStep.functionId,
+              metadata: finalStep.metadata,
+              experimental_context: finalStep.experimental_context,
+              finishReason: finalStep.finishReason,
+              rawFinishReason: finalStep.rawFinishReason,
+              totalUsage,
+              usage: finalStep.usage,
+              content: finalStep.content,
+              text: finalStep.text,
+              reasoningText: finalStep.reasoningText,
+              reasoning: finalStep.reasoning,
+              files: finalStep.files,
+              sources: finalStep.sources,
+              toolCalls: finalStep.toolCalls,
+              staticToolCalls: finalStep.staticToolCalls,
+              dynamicToolCalls: finalStep.dynamicToolCalls,
+              toolResults: finalStep.toolResults,
+              staticToolResults: finalStep.staticToolResults,
+              dynamicToolResults: finalStep.dynamicToolResults,
+              request: finalStep.request,
+              response: finalStep.response,
+              warnings: finalStep.warnings,
+              providerMetadata: finalStep.providerMetadata,
+              steps: recordedSteps
+            },
+            callbacks: [
+              onFinish,
+              globalTelemetry.onFinish
+            ]
+          });
+          rootSpan.setAttributes(
+            await selectTelemetryAttributes({
+              telemetry,
+              attributes: {
+                "ai.response.finishReason": finishReason,
+                "ai.response.text": { output: /* @__PURE__ */ __name(() => finalStep.text, "output") },
+                "ai.response.reasoning": {
+                  output: /* @__PURE__ */ __name(() => finalStep.reasoningText, "output")
+                },
+                "ai.response.toolCalls": {
+                  output: /* @__PURE__ */ __name(() => {
+                    var _a21;
+                    return ((_a21 = finalStep.toolCalls) == null ? void 0 : _a21.length) ? JSON.stringify(finalStep.toolCalls) : void 0;
+                  }, "output")
+                },
+                "ai.response.providerMetadata": JSON.stringify(
+                  finalStep.providerMetadata
+                ),
+                "ai.usage.inputTokens": totalUsage.inputTokens,
+                "ai.usage.outputTokens": totalUsage.outputTokens,
+                "ai.usage.totalTokens": totalUsage.totalTokens,
+                "ai.usage.reasoningTokens": totalUsage.reasoningTokens,
+                "ai.usage.cachedInputTokens": totalUsage.cachedInputTokens
+              }
+            })
+          );
+        } catch (error48) {
+          controller.error(error48);
+        } finally {
+          rootSpan.end();
+        }
+      }
+    });
+    const stitchableStream = createStitchableStream();
+    this.addStream = stitchableStream.addStream;
+    this.closeStream = stitchableStream.close;
+    const reader = stitchableStream.stream.getReader();
+    let stream = new ReadableStream({
+      async start(controller) {
+        controller.enqueue({ type: "start" });
+      },
+      async pull(controller) {
+        function abort() {
+          onAbort == null ? void 0 : onAbort({ steps: recordedSteps });
+          controller.enqueue({
+            type: "abort",
+            // The `reason` is usually of type DOMException, but it can also be of any type,
+            // so we use getErrorMessage for serialization because it is already designed to accept values of the unknown type.
+            // See: https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/reason
+            ...(abortSignal == null ? void 0 : abortSignal.reason) !== void 0 ? { reason: getErrorMessage(abortSignal.reason) } : {}
+          });
+          controller.close();
+        }
+        __name(abort, "abort");
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          if (abortSignal == null ? void 0 : abortSignal.aborted) {
+            abort();
+            return;
+          }
+          controller.enqueue(value);
+        } catch (error48) {
+          if (isAbortError(error48) && (abortSignal == null ? void 0 : abortSignal.aborted)) {
+            abort();
+          } else {
+            controller.error(error48);
+          }
+        }
+      },
+      cancel(reason) {
+        return stitchableStream.stream.cancel(reason);
+      }
+    });
+    for (const transform2 of transforms) {
+      stream = stream.pipeThrough(
+        transform2({
+          tools,
+          stopStream() {
+            stitchableStream.terminate();
+          }
+        })
+      );
+    }
+    this.baseStream = stream.pipeThrough(createOutputTransformStream(output != null ? output : text())).pipeThrough(eventProcessor);
+    const { maxRetries, retry } = prepareRetries({
+      maxRetries: maxRetriesArg,
+      abortSignal
+    });
+    const tracer = getTracer(telemetry);
+    const callSettings = prepareCallSettings(settings);
+    const baseTelemetryAttributes = getBaseTelemetryAttributes({
+      model,
+      telemetry,
+      headers,
+      settings: { ...callSettings, maxRetries }
+    });
+    const self2 = this;
+    const modelInfo = { provider: model.provider, modelId: model.modelId };
+    const callbackTelemetryProps = {
+      functionId: telemetry == null ? void 0 : telemetry.functionId,
+      metadata: telemetry == null ? void 0 : telemetry.metadata
+    };
+    recordSpan({
+      name: "ai.streamText",
+      attributes: selectTelemetryAttributes({
+        telemetry,
+        attributes: {
+          ...assembleOperationName({ operationId: "ai.streamText", telemetry }),
+          ...baseTelemetryAttributes,
+          // specific settings that only make sense on the outer level:
+          "ai.prompt": {
+            input: /* @__PURE__ */ __name(() => JSON.stringify({ system, prompt, messages }), "input")
+          }
+        }
+      }),
+      tracer,
+      endWhenDone: false,
+      fn: /* @__PURE__ */ __name(async (rootSpanArg) => {
+        rootSpan = rootSpanArg;
+        const initialPrompt = await standardizePrompt({
+          system,
+          prompt,
+          messages
+        });
+        await notify({
+          event: {
+            model: modelInfo,
+            system,
+            prompt,
+            messages,
+            tools,
+            toolChoice,
+            activeTools,
+            maxOutputTokens: callSettings.maxOutputTokens,
+            temperature: callSettings.temperature,
+            topP: callSettings.topP,
+            topK: callSettings.topK,
+            presencePenalty: callSettings.presencePenalty,
+            frequencyPenalty: callSettings.frequencyPenalty,
+            stopSequences: callSettings.stopSequences,
+            seed: callSettings.seed,
+            maxRetries,
+            timeout,
+            headers,
+            providerOptions,
+            stopWhen,
+            output,
+            abortSignal: originalAbortSignal,
+            include,
+            ...callbackTelemetryProps,
+            experimental_context
+          },
+          callbacks: [
+            onStart,
+            globalTelemetry.onStart
+          ]
+        });
+        const initialMessages = initialPrompt.messages;
+        const initialResponseMessages = [];
+        const { approvedToolApprovals, deniedToolApprovals } = collectToolApprovals({ messages: initialMessages });
+        if (deniedToolApprovals.length > 0 || approvedToolApprovals.length > 0) {
+          const providerExecutedToolApprovals = [
+            ...approvedToolApprovals,
+            ...deniedToolApprovals
+          ].filter((toolApproval) => toolApproval.toolCall.providerExecuted);
+          const localApprovedToolApprovals = approvedToolApprovals.filter(
+            (toolApproval) => !toolApproval.toolCall.providerExecuted
+          );
+          const localDeniedToolApprovals = deniedToolApprovals.filter(
+            (toolApproval) => !toolApproval.toolCall.providerExecuted
+          );
+          const deniedProviderExecutedToolApprovals = deniedToolApprovals.filter(
+            (toolApproval) => toolApproval.toolCall.providerExecuted
+          );
+          let toolExecutionStepStreamController;
+          const toolExecutionStepStream = new ReadableStream({
+            start(controller) {
+              toolExecutionStepStreamController = controller;
+            }
+          });
+          self2.addStream(toolExecutionStepStream);
+          try {
+            for (const toolApproval of [
+              ...localDeniedToolApprovals,
+              ...deniedProviderExecutedToolApprovals
+            ]) {
+              toolExecutionStepStreamController == null ? void 0 : toolExecutionStepStreamController.enqueue({
+                type: "tool-output-denied",
+                toolCallId: toolApproval.toolCall.toolCallId,
+                toolName: toolApproval.toolCall.toolName
+              });
+            }
+            const toolOutputs = [];
+            await Promise.all(
+              localApprovedToolApprovals.map(async (toolApproval) => {
+                const result = await executeToolCall({
+                  toolCall: toolApproval.toolCall,
+                  tools,
+                  tracer,
+                  telemetry,
+                  messages: initialMessages,
+                  abortSignal,
+                  experimental_context,
+                  stepNumber: recordedSteps.length,
+                  model: modelInfo,
+                  onToolCallStart: [
+                    onToolCallStart,
+                    globalTelemetry.onToolCallStart
+                  ],
+                  onToolCallFinish: [
+                    onToolCallFinish,
+                    globalTelemetry.onToolCallFinish
+                  ],
+                  onPreliminaryToolResult: /* @__PURE__ */ __name((result2) => {
+                    toolExecutionStepStreamController == null ? void 0 : toolExecutionStepStreamController.enqueue(result2);
+                  }, "onPreliminaryToolResult")
+                });
+                if (result != null) {
+                  toolExecutionStepStreamController == null ? void 0 : toolExecutionStepStreamController.enqueue(result);
+                  toolOutputs.push(result);
+                }
+              })
+            );
+            if (providerExecutedToolApprovals.length > 0) {
+              initialResponseMessages.push({
+                role: "tool",
+                content: providerExecutedToolApprovals.map(
+                  (toolApproval) => ({
+                    type: "tool-approval-response",
+                    approvalId: toolApproval.approvalResponse.approvalId,
+                    approved: toolApproval.approvalResponse.approved,
+                    reason: toolApproval.approvalResponse.reason,
+                    providerExecuted: true
+                  })
+                )
+              });
+            }
+            if (toolOutputs.length > 0 || localDeniedToolApprovals.length > 0) {
+              const localToolContent = [];
+              for (const output2 of toolOutputs) {
+                localToolContent.push({
+                  type: "tool-result",
+                  toolCallId: output2.toolCallId,
+                  toolName: output2.toolName,
+                  output: await createToolModelOutput({
+                    toolCallId: output2.toolCallId,
+                    input: output2.input,
+                    tool: tools == null ? void 0 : tools[output2.toolName],
+                    output: output2.type === "tool-result" ? output2.output : output2.error,
+                    errorMode: output2.type === "tool-error" ? "text" : "none"
+                  })
+                });
+              }
+              for (const toolApproval of localDeniedToolApprovals) {
+                localToolContent.push({
+                  type: "tool-result",
+                  toolCallId: toolApproval.toolCall.toolCallId,
+                  toolName: toolApproval.toolCall.toolName,
+                  output: {
+                    type: "execution-denied",
+                    reason: toolApproval.approvalResponse.reason
+                  }
+                });
+              }
+              initialResponseMessages.push({
+                role: "tool",
+                content: localToolContent
+              });
+            }
+          } finally {
+            toolExecutionStepStreamController == null ? void 0 : toolExecutionStepStreamController.close();
+          }
+        }
+        recordedResponseMessages.push(...initialResponseMessages);
+        async function streamStep({
+          currentStep,
+          responseMessages,
+          usage
+        }) {
+          var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i;
+          const includeRawChunks2 = self2.includeRawChunks;
+          const stepTimeoutId = stepTimeoutMs != null ? setTimeout(() => stepAbortController.abort(), stepTimeoutMs) : void 0;
+          let chunkTimeoutId = void 0;
+          function resetChunkTimeout() {
+            if (chunkTimeoutMs != null) {
+              if (chunkTimeoutId != null) {
+                clearTimeout(chunkTimeoutId);
+              }
+              chunkTimeoutId = setTimeout(
+                () => chunkAbortController.abort(),
+                chunkTimeoutMs
+              );
+            }
+          }
+          __name(resetChunkTimeout, "resetChunkTimeout");
+          function clearChunkTimeout() {
+            if (chunkTimeoutId != null) {
+              clearTimeout(chunkTimeoutId);
+              chunkTimeoutId = void 0;
+            }
+          }
+          __name(clearChunkTimeout, "clearChunkTimeout");
+          function clearStepTimeout() {
+            if (stepTimeoutId != null) {
+              clearTimeout(stepTimeoutId);
+            }
+          }
+          __name(clearStepTimeout, "clearStepTimeout");
+          try {
+            stepFinish = new DelayedPromise();
+            const stepInputMessages = [...initialMessages, ...responseMessages];
+            const prepareStepResult = await (prepareStep == null ? void 0 : prepareStep({
+              model,
+              steps: recordedSteps,
+              stepNumber: recordedSteps.length,
+              messages: stepInputMessages,
+              experimental_context
+            }));
+            const stepModel = resolveLanguageModel(
+              (_a21 = prepareStepResult == null ? void 0 : prepareStepResult.model) != null ? _a21 : model
+            );
+            const stepModelInfo = {
+              provider: stepModel.provider,
+              modelId: stepModel.modelId
+            };
+            const promptMessages = await convertToLanguageModelPrompt({
+              prompt: {
+                system: (_b17 = prepareStepResult == null ? void 0 : prepareStepResult.system) != null ? _b17 : initialPrompt.system,
+                messages: (_c = prepareStepResult == null ? void 0 : prepareStepResult.messages) != null ? _c : stepInputMessages
+              },
+              supportedUrls: await stepModel.supportedUrls,
+              download: download2
+            });
+            const stepActiveTools = (_d = prepareStepResult == null ? void 0 : prepareStepResult.activeTools) != null ? _d : activeTools;
+            const { toolChoice: stepToolChoice, tools: stepTools } = await prepareToolsAndToolChoice({
+              tools,
+              toolChoice: (_e2 = prepareStepResult == null ? void 0 : prepareStepResult.toolChoice) != null ? _e2 : toolChoice,
+              activeTools: stepActiveTools
+            });
+            experimental_context = (_f = prepareStepResult == null ? void 0 : prepareStepResult.experimental_context) != null ? _f : experimental_context;
+            const stepMessages = (_g = prepareStepResult == null ? void 0 : prepareStepResult.messages) != null ? _g : stepInputMessages;
+            const stepSystem = (_h = prepareStepResult == null ? void 0 : prepareStepResult.system) != null ? _h : initialPrompt.system;
+            const stepProviderOptions = mergeObjects(
+              providerOptions,
+              prepareStepResult == null ? void 0 : prepareStepResult.providerOptions
+            );
+            await notify({
+              event: {
+                stepNumber: recordedSteps.length,
+                model: stepModelInfo,
+                system: stepSystem,
+                messages: stepMessages,
+                tools,
+                toolChoice: stepToolChoice,
+                activeTools: stepActiveTools,
+                steps: [...recordedSteps],
+                providerOptions: stepProviderOptions,
+                timeout,
+                headers,
+                stopWhen,
+                output,
+                abortSignal: originalAbortSignal,
+                include,
+                ...callbackTelemetryProps,
+                experimental_context
+              },
+              callbacks: [
+                onStepStart,
+                globalTelemetry.onStepStart
+              ]
+            });
+            const {
+              result: { stream: stream2, response, request },
+              doStreamSpan,
+              startTimestampMs
+            } = await retry(
+              () => recordSpan({
+                name: "ai.streamText.doStream",
+                attributes: selectTelemetryAttributes({
+                  telemetry,
+                  attributes: {
+                    ...assembleOperationName({
+                      operationId: "ai.streamText.doStream",
+                      telemetry
+                    }),
+                    ...baseTelemetryAttributes,
+                    // model:
+                    "ai.model.provider": stepModel.provider,
+                    "ai.model.id": stepModel.modelId,
+                    // prompt:
+                    "ai.prompt.messages": {
+                      input: /* @__PURE__ */ __name(() => stringifyForTelemetry(promptMessages), "input")
+                    },
+                    "ai.prompt.tools": {
+                      // convert the language model level tools:
+                      input: /* @__PURE__ */ __name(() => stepTools == null ? void 0 : stepTools.map((tool2) => JSON.stringify(tool2)), "input")
+                    },
+                    "ai.prompt.toolChoice": {
+                      input: /* @__PURE__ */ __name(() => stepToolChoice != null ? JSON.stringify(stepToolChoice) : void 0, "input")
+                    },
+                    // standardized gen-ai llm span attributes:
+                    "gen_ai.system": stepModel.provider,
+                    "gen_ai.request.model": stepModel.modelId,
+                    "gen_ai.request.frequency_penalty": callSettings.frequencyPenalty,
+                    "gen_ai.request.max_tokens": callSettings.maxOutputTokens,
+                    "gen_ai.request.presence_penalty": callSettings.presencePenalty,
+                    "gen_ai.request.stop_sequences": callSettings.stopSequences,
+                    "gen_ai.request.temperature": callSettings.temperature,
+                    "gen_ai.request.top_k": callSettings.topK,
+                    "gen_ai.request.top_p": callSettings.topP
+                  }
+                }),
+                tracer,
+                endWhenDone: false,
+                fn: /* @__PURE__ */ __name(async (doStreamSpan2) => ({
+                  startTimestampMs: now2(),
+                  // get before the call
+                  doStreamSpan: doStreamSpan2,
+                  result: await stepModel.doStream({
+                    ...callSettings,
+                    tools: stepTools,
+                    toolChoice: stepToolChoice,
+                    responseFormat: await (output == null ? void 0 : output.responseFormat),
+                    prompt: promptMessages,
+                    providerOptions: stepProviderOptions,
+                    abortSignal,
+                    headers,
+                    includeRawChunks: includeRawChunks2
+                  })
+                }), "fn")
+              })
+            );
+            const streamWithToolResults = runToolsTransformation({
+              tools,
+              generatorStream: stream2,
+              tracer,
+              telemetry,
+              system,
+              messages: stepInputMessages,
+              repairToolCall,
+              abortSignal,
+              experimental_context,
+              generateId: generateId2,
+              stepNumber: recordedSteps.length,
+              model: stepModelInfo,
+              onToolCallStart: [
+                onToolCallStart,
+                globalTelemetry.onToolCallStart
+              ],
+              onToolCallFinish: [
+                onToolCallFinish,
+                globalTelemetry.onToolCallFinish
+              ]
+            });
+            const stepRequest = ((_i = include == null ? void 0 : include.requestBody) != null ? _i : true) ? request != null ? request : {} : { ...request, body: void 0 };
+            const stepToolCalls = [];
+            const stepToolOutputs = [];
+            let warnings;
+            const activeToolCallToolNames = {};
+            let stepFinishReason = "other";
+            let stepRawFinishReason = void 0;
+            let stepUsage = createNullLanguageModelUsage();
+            let stepProviderMetadata;
+            let stepFirstChunk = true;
+            let stepResponse = {
+              id: generateId2(),
+              timestamp: /* @__PURE__ */ new Date(),
+              modelId: modelInfo.modelId
+            };
+            let activeText = "";
+            self2.addStream(
+              streamWithToolResults.pipeThrough(
+                new TransformStream({
+                  async transform(chunk, controller) {
+                    var _a222, _b23, _c2, _d2, _e22;
+                    resetChunkTimeout();
+                    if (chunk.type === "stream-start") {
+                      warnings = chunk.warnings;
+                      return;
+                    }
+                    if (stepFirstChunk) {
+                      const msToFirstChunk = now2() - startTimestampMs;
+                      stepFirstChunk = false;
+                      doStreamSpan.addEvent("ai.stream.firstChunk", {
+                        "ai.response.msToFirstChunk": msToFirstChunk
+                      });
+                      doStreamSpan.setAttributes({
+                        "ai.response.msToFirstChunk": msToFirstChunk
+                      });
+                      controller.enqueue({
+                        type: "start-step",
+                        request: stepRequest,
+                        warnings: warnings != null ? warnings : []
+                      });
+                    }
+                    const chunkType = chunk.type;
+                    switch (chunkType) {
+                      case "tool-approval-request":
+                      case "text-start":
+                      case "text-end": {
+                        controller.enqueue(chunk);
+                        break;
+                      }
+                      case "text-delta": {
+                        if (chunk.delta.length > 0) {
+                          controller.enqueue({
+                            type: "text-delta",
+                            id: chunk.id,
+                            text: chunk.delta,
+                            providerMetadata: chunk.providerMetadata
+                          });
+                          activeText += chunk.delta;
+                        }
+                        break;
+                      }
+                      case "reasoning-start":
+                      case "reasoning-end": {
+                        controller.enqueue(chunk);
+                        break;
+                      }
+                      case "reasoning-delta": {
+                        controller.enqueue({
+                          type: "reasoning-delta",
+                          id: chunk.id,
+                          text: chunk.delta,
+                          providerMetadata: chunk.providerMetadata
+                        });
+                        break;
+                      }
+                      case "tool-call": {
+                        controller.enqueue(chunk);
+                        stepToolCalls.push(chunk);
+                        break;
+                      }
+                      case "tool-result": {
+                        controller.enqueue(chunk);
+                        if (!chunk.preliminary) {
+                          stepToolOutputs.push(chunk);
+                        }
+                        break;
+                      }
+                      case "tool-error": {
+                        controller.enqueue(chunk);
+                        stepToolOutputs.push(chunk);
+                        break;
+                      }
+                      case "response-metadata": {
+                        stepResponse = {
+                          id: (_a222 = chunk.id) != null ? _a222 : stepResponse.id,
+                          timestamp: (_b23 = chunk.timestamp) != null ? _b23 : stepResponse.timestamp,
+                          modelId: (_c2 = chunk.modelId) != null ? _c2 : stepResponse.modelId
+                        };
+                        break;
+                      }
+                      case "finish": {
+                        stepUsage = chunk.usage;
+                        stepFinishReason = chunk.finishReason;
+                        stepRawFinishReason = chunk.rawFinishReason;
+                        stepProviderMetadata = chunk.providerMetadata;
+                        const msToFinish = now2() - startTimestampMs;
+                        doStreamSpan.addEvent("ai.stream.finish");
+                        doStreamSpan.setAttributes({
+                          "ai.response.msToFinish": msToFinish,
+                          "ai.response.avgOutputTokensPerSecond": 1e3 * ((_d2 = stepUsage.outputTokens) != null ? _d2 : 0) / msToFinish
+                        });
+                        break;
+                      }
+                      case "file": {
+                        controller.enqueue(chunk);
+                        break;
+                      }
+                      case "source": {
+                        controller.enqueue(chunk);
+                        break;
+                      }
+                      case "tool-input-start": {
+                        activeToolCallToolNames[chunk.id] = chunk.toolName;
+                        const tool2 = tools == null ? void 0 : tools[chunk.toolName];
+                        if ((tool2 == null ? void 0 : tool2.onInputStart) != null) {
+                          await tool2.onInputStart({
+                            toolCallId: chunk.id,
+                            messages: stepInputMessages,
+                            abortSignal,
+                            experimental_context
+                          });
+                        }
+                        controller.enqueue({
+                          ...chunk,
+                          dynamic: (_e22 = chunk.dynamic) != null ? _e22 : (tool2 == null ? void 0 : tool2.type) === "dynamic",
+                          title: tool2 == null ? void 0 : tool2.title
+                        });
+                        break;
+                      }
+                      case "tool-input-end": {
+                        delete activeToolCallToolNames[chunk.id];
+                        controller.enqueue(chunk);
+                        break;
+                      }
+                      case "tool-input-delta": {
+                        const toolName = activeToolCallToolNames[chunk.id];
+                        const tool2 = tools == null ? void 0 : tools[toolName];
+                        if ((tool2 == null ? void 0 : tool2.onInputDelta) != null) {
+                          await tool2.onInputDelta({
+                            inputTextDelta: chunk.delta,
+                            toolCallId: chunk.id,
+                            messages: stepInputMessages,
+                            abortSignal,
+                            experimental_context
+                          });
+                        }
+                        controller.enqueue(chunk);
+                        break;
+                      }
+                      case "error": {
+                        controller.enqueue(chunk);
+                        stepFinishReason = "error";
+                        break;
+                      }
+                      case "raw": {
+                        if (includeRawChunks2) {
+                          controller.enqueue(chunk);
+                        }
+                        break;
+                      }
+                      default: {
+                        const exhaustiveCheck = chunkType;
+                        throw new Error(
+                          `Unknown chunk type: ${exhaustiveCheck}`
+                        );
+                      }
+                    }
+                  },
+                  // invoke onFinish callback and resolve toolResults promise when the stream is about to close:
+                  async flush(controller) {
+                    const stepToolCallsJson = stepToolCalls.length > 0 ? JSON.stringify(stepToolCalls) : void 0;
+                    try {
+                      doStreamSpan.setAttributes(
+                        await selectTelemetryAttributes({
+                          telemetry,
+                          attributes: {
+                            "ai.response.finishReason": stepFinishReason,
+                            "ai.response.text": {
+                              output: /* @__PURE__ */ __name(() => activeText, "output")
+                            },
+                            "ai.response.reasoning": {
+                              output: /* @__PURE__ */ __name(() => {
+                                const reasoningParts = recordedContent.filter(
+                                  (c2) => c2.type === "reasoning"
+                                );
+                                return reasoningParts.length > 0 ? reasoningParts.map((r2) => r2.text).join("\n") : void 0;
+                              }, "output")
+                            },
+                            "ai.response.toolCalls": {
+                              output: /* @__PURE__ */ __name(() => stepToolCallsJson, "output")
+                            },
+                            "ai.response.id": stepResponse.id,
+                            "ai.response.model": stepResponse.modelId,
+                            "ai.response.timestamp": stepResponse.timestamp.toISOString(),
+                            "ai.response.providerMetadata": JSON.stringify(stepProviderMetadata),
+                            "ai.usage.inputTokens": stepUsage.inputTokens,
+                            "ai.usage.outputTokens": stepUsage.outputTokens,
+                            "ai.usage.totalTokens": stepUsage.totalTokens,
+                            "ai.usage.reasoningTokens": stepUsage.reasoningTokens,
+                            "ai.usage.cachedInputTokens": stepUsage.cachedInputTokens,
+                            // standardized gen-ai llm span attributes:
+                            "gen_ai.response.finish_reasons": [
+                              stepFinishReason
+                            ],
+                            "gen_ai.response.id": stepResponse.id,
+                            "gen_ai.response.model": stepResponse.modelId,
+                            "gen_ai.usage.input_tokens": stepUsage.inputTokens,
+                            "gen_ai.usage.output_tokens": stepUsage.outputTokens
+                          }
+                        })
+                      );
+                    } catch (error48) {
+                    } finally {
+                      doStreamSpan.end();
+                    }
+                    controller.enqueue({
+                      type: "finish-step",
+                      finishReason: stepFinishReason,
+                      rawFinishReason: stepRawFinishReason,
+                      usage: stepUsage,
+                      providerMetadata: stepProviderMetadata,
+                      response: {
+                        ...stepResponse,
+                        headers: response == null ? void 0 : response.headers
+                      }
+                    });
+                    const combinedUsage = addLanguageModelUsage(
+                      usage,
+                      stepUsage
+                    );
+                    await stepFinish.promise;
+                    const clientToolCalls = stepToolCalls.filter(
+                      (toolCall) => toolCall.providerExecuted !== true
+                    );
+                    const clientToolOutputs = stepToolOutputs.filter(
+                      (toolOutput) => toolOutput.providerExecuted !== true
+                    );
+                    for (const toolCall of stepToolCalls) {
+                      if (toolCall.providerExecuted !== true)
+                        continue;
+                      const tool2 = tools == null ? void 0 : tools[toolCall.toolName];
+                      if ((tool2 == null ? void 0 : tool2.type) === "provider" && tool2.supportsDeferredResults) {
+                        const hasResultInStep = stepToolOutputs.some(
+                          (output2) => (output2.type === "tool-result" || output2.type === "tool-error") && output2.toolCallId === toolCall.toolCallId
+                        );
+                        if (!hasResultInStep) {
+                          pendingDeferredToolCalls.set(toolCall.toolCallId, {
+                            toolName: toolCall.toolName
+                          });
+                        }
+                      }
+                    }
+                    for (const output2 of stepToolOutputs) {
+                      if (output2.type === "tool-result" || output2.type === "tool-error") {
+                        pendingDeferredToolCalls.delete(output2.toolCallId);
+                      }
+                    }
+                    clearStepTimeout();
+                    clearChunkTimeout();
+                    if (
+                      // Continue if:
+                      // 1. There are client tool calls that have all been executed, OR
+                      // 2. There are pending deferred results from provider-executed tools
+                      (clientToolCalls.length > 0 && clientToolOutputs.length === clientToolCalls.length || pendingDeferredToolCalls.size > 0) && // continue until a stop condition is met:
+                      !await isStopConditionMet({
+                        stopConditions,
+                        steps: recordedSteps
+                      })
+                    ) {
+                      responseMessages.push(
+                        ...await toResponseMessages({
+                          content: (
+                            // use transformed content to create the messages for the next step:
+                            recordedSteps[recordedSteps.length - 1].content
+                          ),
+                          tools
+                        })
+                      );
+                      try {
+                        await streamStep({
+                          currentStep: currentStep + 1,
+                          responseMessages,
+                          usage: combinedUsage
+                        });
+                      } catch (error48) {
+                        controller.enqueue({
+                          type: "error",
+                          error: error48
+                        });
+                        self2.closeStream();
+                      }
+                    } else {
+                      controller.enqueue({
+                        type: "finish",
+                        finishReason: stepFinishReason,
+                        rawFinishReason: stepRawFinishReason,
+                        totalUsage: combinedUsage
+                      });
+                      self2.closeStream();
+                    }
+                  }
+                })
+              )
+            );
+          } finally {
+            clearStepTimeout();
+            clearChunkTimeout();
+          }
+        }
+        __name(streamStep, "streamStep");
+        await streamStep({
+          currentStep: 0,
+          responseMessages: initialResponseMessages,
+          usage: createNullLanguageModelUsage()
+        });
+      }, "fn")
+    }).catch((error48) => {
+      self2.addStream(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "error", error: error48 });
+            controller.close();
+          }
+        })
+      );
+      self2.closeStream();
+    });
+  }
+  get steps() {
+    this.consumeStream();
+    return this._steps.promise;
+  }
+  get finalStep() {
+    return this.steps.then((steps) => steps[steps.length - 1]);
+  }
+  get content() {
+    return this.finalStep.then((step) => step.content);
+  }
+  get warnings() {
+    return this.finalStep.then((step) => step.warnings);
+  }
+  get providerMetadata() {
+    return this.finalStep.then((step) => step.providerMetadata);
+  }
+  get text() {
+    return this.finalStep.then((step) => step.text);
+  }
+  get reasoningText() {
+    return this.finalStep.then((step) => step.reasoningText);
+  }
+  get reasoning() {
+    return this.finalStep.then((step) => step.reasoning);
+  }
+  get sources() {
+    return this.finalStep.then((step) => step.sources);
+  }
+  get files() {
+    return this.finalStep.then((step) => step.files);
+  }
+  get toolCalls() {
+    return this.finalStep.then((step) => step.toolCalls);
+  }
+  get staticToolCalls() {
+    return this.finalStep.then((step) => step.staticToolCalls);
+  }
+  get dynamicToolCalls() {
+    return this.finalStep.then((step) => step.dynamicToolCalls);
+  }
+  get toolResults() {
+    return this.finalStep.then((step) => step.toolResults);
+  }
+  get staticToolResults() {
+    return this.finalStep.then((step) => step.staticToolResults);
+  }
+  get dynamicToolResults() {
+    return this.finalStep.then((step) => step.dynamicToolResults);
+  }
+  get usage() {
+    return this.finalStep.then((step) => step.usage);
+  }
+  get request() {
+    return this.finalStep.then((step) => step.request);
+  }
+  get response() {
+    return this.finalStep.then((step) => step.response);
+  }
+  get totalUsage() {
+    this.consumeStream();
+    return this._totalUsage.promise;
+  }
+  get finishReason() {
+    this.consumeStream();
+    return this._finishReason.promise;
+  }
+  get rawFinishReason() {
+    this.consumeStream();
+    return this._rawFinishReason.promise;
+  }
+  /**
+   * Split out a new stream from the original stream.
+   * The original stream is replaced to allow for further splitting,
+   * since we do not know how many times the stream will be split.
+   *
+   * Note: this leads to buffering the stream content on the server.
+   * However, the LLM results are expected to be small enough to not cause issues.
+   */
+  teeStream() {
+    const [stream1, stream2] = this.baseStream.tee();
+    this.baseStream = stream2;
+    return stream1;
+  }
+  get textStream() {
+    return createAsyncIterableStream(
+      this.teeStream().pipeThrough(
+        new TransformStream({
+          transform({ part }, controller) {
+            if (part.type === "text-delta") {
+              controller.enqueue(part.text);
+            }
+          }
+        })
+      )
+    );
+  }
+  get fullStream() {
+    return createAsyncIterableStream(
+      this.teeStream().pipeThrough(
+        new TransformStream({
+          transform({ part }, controller) {
+            controller.enqueue(part);
+          }
+        })
+      )
+    );
+  }
+  async consumeStream(options) {
+    var _a21;
+    try {
+      await consumeStream({
+        stream: this.fullStream,
+        onError: options == null ? void 0 : options.onError
+      });
+    } catch (error48) {
+      (_a21 = options == null ? void 0 : options.onError) == null ? void 0 : _a21.call(options, error48);
+    }
+  }
+  get experimental_partialOutputStream() {
+    return this.partialOutputStream;
+  }
+  get partialOutputStream() {
+    return createAsyncIterableStream(
+      this.teeStream().pipeThrough(
+        new TransformStream({
+          transform({ partialOutput }, controller) {
+            if (partialOutput != null) {
+              controller.enqueue(partialOutput);
+            }
+          }
+        })
+      )
+    );
+  }
+  get elementStream() {
+    var _a21, _b17, _c;
+    const transform2 = (_a21 = this.outputSpecification) == null ? void 0 : _a21.createElementStreamTransform();
+    if (transform2 == null) {
+      throw new UnsupportedFunctionalityError({
+        functionality: `element streams in ${(_c = (_b17 = this.outputSpecification) == null ? void 0 : _b17.name) != null ? _c : "text"} mode`
+      });
+    }
+    return createAsyncIterableStream(this.teeStream().pipeThrough(transform2));
+  }
+  get output() {
+    return this.finalStep.then((step) => {
+      var _a21;
+      const output = (_a21 = this.outputSpecification) != null ? _a21 : text();
+      return output.parseCompleteOutput(
+        { text: step.text },
+        {
+          response: step.response,
+          usage: step.usage,
+          finishReason: step.finishReason
+        }
+      );
+    });
+  }
+  toUIMessageStream({
+    originalMessages,
+    generateMessageId,
+    onFinish,
+    messageMetadata,
+    sendReasoning = true,
+    sendSources = false,
+    sendStart = true,
+    sendFinish = true,
+    onError = getErrorMessage
+  } = {}) {
+    const responseMessageId = generateMessageId != null ? getResponseUIMessageId({
+      originalMessages,
+      responseMessageId: generateMessageId
+    }) : void 0;
+    const isDynamic = /* @__PURE__ */ __name((part) => {
+      var _a21;
+      const tool2 = (_a21 = this.tools) == null ? void 0 : _a21[part.toolName];
+      if (tool2 == null) {
+        return part.dynamic;
+      }
+      return (tool2 == null ? void 0 : tool2.type) === "dynamic" ? true : void 0;
+    }, "isDynamic");
+    const baseStream = this.fullStream.pipeThrough(
+      new TransformStream({
+        transform: /* @__PURE__ */ __name(async (part, controller) => {
+          const messageMetadataValue = messageMetadata == null ? void 0 : messageMetadata({ part });
+          const partType = part.type;
+          switch (partType) {
+            case "text-start": {
+              controller.enqueue({
+                type: "text-start",
+                id: part.id,
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+              });
+              break;
+            }
+            case "text-delta": {
+              controller.enqueue({
+                type: "text-delta",
+                id: part.id,
+                delta: part.text,
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+              });
+              break;
+            }
+            case "text-end": {
+              controller.enqueue({
+                type: "text-end",
+                id: part.id,
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+              });
+              break;
+            }
+            case "reasoning-start": {
+              controller.enqueue({
+                type: "reasoning-start",
+                id: part.id,
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+              });
+              break;
+            }
+            case "reasoning-delta": {
+              if (sendReasoning) {
+                controller.enqueue({
+                  type: "reasoning-delta",
+                  id: part.id,
+                  delta: part.text,
+                  ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+                });
+              }
+              break;
+            }
+            case "reasoning-end": {
+              controller.enqueue({
+                type: "reasoning-end",
+                id: part.id,
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+              });
+              break;
+            }
+            case "file": {
+              controller.enqueue({
+                type: "file",
+                mediaType: part.file.mediaType,
+                url: `data:${part.file.mediaType};base64,${part.file.base64}`,
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+              });
+              break;
+            }
+            case "source": {
+              if (sendSources && part.sourceType === "url") {
+                controller.enqueue({
+                  type: "source-url",
+                  sourceId: part.id,
+                  url: part.url,
+                  title: part.title,
+                  ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+                });
+              }
+              if (sendSources && part.sourceType === "document") {
+                controller.enqueue({
+                  type: "source-document",
+                  sourceId: part.id,
+                  mediaType: part.mediaType,
+                  title: part.title,
+                  filename: part.filename,
+                  ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {}
+                });
+              }
+              break;
+            }
+            case "tool-input-start": {
+              const dynamic = isDynamic(part);
+              controller.enqueue({
+                type: "tool-input-start",
+                toolCallId: part.id,
+                toolName: part.toolName,
+                ...part.providerExecuted != null ? { providerExecuted: part.providerExecuted } : {},
+                ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {},
+                ...dynamic != null ? { dynamic } : {},
+                ...part.title != null ? { title: part.title } : {}
+              });
+              break;
+            }
+            case "tool-input-delta": {
+              controller.enqueue({
+                type: "tool-input-delta",
+                toolCallId: part.id,
+                inputTextDelta: part.delta
+              });
+              break;
+            }
+            case "tool-call": {
+              const dynamic = isDynamic(part);
+              if (part.invalid) {
+                controller.enqueue({
+                  type: "tool-input-error",
+                  toolCallId: part.toolCallId,
+                  toolName: part.toolName,
+                  input: part.input,
+                  ...part.providerExecuted != null ? { providerExecuted: part.providerExecuted } : {},
+                  ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {},
+                  ...dynamic != null ? { dynamic } : {},
+                  errorText: onError(part.error),
+                  ...part.title != null ? { title: part.title } : {}
+                });
+              } else {
+                controller.enqueue({
+                  type: "tool-input-available",
+                  toolCallId: part.toolCallId,
+                  toolName: part.toolName,
+                  input: part.input,
+                  ...part.providerExecuted != null ? { providerExecuted: part.providerExecuted } : {},
+                  ...part.providerMetadata != null ? { providerMetadata: part.providerMetadata } : {},
+                  ...dynamic != null ? { dynamic } : {},
+                  ...part.title != null ? { title: part.title } : {}
+                });
+              }
+              break;
+            }
+            case "tool-approval-request": {
+              controller.enqueue({
+                type: "tool-approval-request",
+                approvalId: part.approvalId,
+                toolCallId: part.toolCall.toolCallId
+              });
+              break;
+            }
+            case "tool-result": {
+              const dynamic = isDynamic(part);
+              controller.enqueue({
+                type: "tool-output-available",
+                toolCallId: part.toolCallId,
+                output: part.output,
+                ...part.providerExecuted != null ? { providerExecuted: part.providerExecuted } : {},
+                ...part.preliminary != null ? { preliminary: part.preliminary } : {},
+                ...dynamic != null ? { dynamic } : {}
+              });
+              break;
+            }
+            case "tool-error": {
+              const dynamic = isDynamic(part);
+              controller.enqueue({
+                type: "tool-output-error",
+                toolCallId: part.toolCallId,
+                errorText: onError(part.error),
+                ...part.providerExecuted != null ? { providerExecuted: part.providerExecuted } : {},
+                ...dynamic != null ? { dynamic } : {}
+              });
+              break;
+            }
+            case "tool-output-denied": {
+              controller.enqueue({
+                type: "tool-output-denied",
+                toolCallId: part.toolCallId
+              });
+              break;
+            }
+            case "error": {
+              controller.enqueue({
+                type: "error",
+                errorText: onError(part.error)
+              });
+              break;
+            }
+            case "start-step": {
+              controller.enqueue({ type: "start-step" });
+              break;
+            }
+            case "finish-step": {
+              controller.enqueue({ type: "finish-step" });
+              break;
+            }
+            case "start": {
+              if (sendStart) {
+                controller.enqueue({
+                  type: "start",
+                  ...messageMetadataValue != null ? { messageMetadata: messageMetadataValue } : {},
+                  ...responseMessageId != null ? { messageId: responseMessageId } : {}
+                });
+              }
+              break;
+            }
+            case "finish": {
+              if (sendFinish) {
+                controller.enqueue({
+                  type: "finish",
+                  finishReason: part.finishReason,
+                  ...messageMetadataValue != null ? { messageMetadata: messageMetadataValue } : {}
+                });
+              }
+              break;
+            }
+            case "abort": {
+              controller.enqueue(part);
+              break;
+            }
+            case "tool-input-end": {
+              break;
+            }
+            case "raw": {
+              break;
+            }
+            default: {
+              const exhaustiveCheck = partType;
+              throw new Error(`Unknown chunk type: ${exhaustiveCheck}`);
+            }
+          }
+          if (messageMetadataValue != null && partType !== "start" && partType !== "finish") {
+            controller.enqueue({
+              type: "message-metadata",
+              messageMetadata: messageMetadataValue
+            });
+          }
+        }, "transform")
+      })
+    );
+    return createAsyncIterableStream(
+      handleUIMessageStreamFinish({
+        stream: baseStream,
+        messageId: responseMessageId != null ? responseMessageId : generateMessageId == null ? void 0 : generateMessageId(),
+        originalMessages,
+        onFinish,
+        onError
+      })
+    );
+  }
+  pipeUIMessageStreamToResponse(response, {
+    originalMessages,
+    generateMessageId,
+    onFinish,
+    messageMetadata,
+    sendReasoning,
+    sendSources,
+    sendFinish,
+    sendStart,
+    onError,
+    ...init
+  } = {}) {
+    pipeUIMessageStreamToResponse({
+      response,
+      stream: this.toUIMessageStream({
+        originalMessages,
+        generateMessageId,
+        onFinish,
+        messageMetadata,
+        sendReasoning,
+        sendSources,
+        sendFinish,
+        sendStart,
+        onError
+      }),
+      ...init
+    });
+  }
+  pipeTextStreamToResponse(response, init) {
+    pipeTextStreamToResponse({
+      response,
+      textStream: this.textStream,
+      ...init
+    });
+  }
+  toUIMessageStreamResponse({
+    originalMessages,
+    generateMessageId,
+    onFinish,
+    messageMetadata,
+    sendReasoning,
+    sendSources,
+    sendFinish,
+    sendStart,
+    onError,
+    ...init
+  } = {}) {
+    return createUIMessageStreamResponse({
+      stream: this.toUIMessageStream({
+        originalMessages,
+        generateMessageId,
+        onFinish,
+        messageMetadata,
+        sendReasoning,
+        sendSources,
+        sendFinish,
+        sendStart,
+        onError
+      }),
+      ...init
+    });
+  }
+  toTextStreamResponse(init) {
+    return createTextStreamResponse({
+      textStream: this.textStream,
+      ...init
+    });
+  }
+};
 var uiMessagesSchema = lazySchema(
   () => zodSchema(
     external_exports.array(
@@ -32542,8 +35651,8 @@ var _a20;
 _a20 = symbol20;
 var defaultDownload2 = createDownload();
 
-// node_modules/@ai-sdk/openai/dist/index.mjs
-var openaiErrorDataSchema = external_exports.object({
+// node_modules/@ai-sdk/openai-compatible/dist/index.mjs
+var openaiCompatibleErrorDataSchema = external_exports.object({
   error: external_exports.object({
     message: external_exports.string(),
     // The additional information below is handled loosely to support
@@ -32554,26 +35663,11 @@ var openaiErrorDataSchema = external_exports.object({
     code: external_exports.union([external_exports.string(), external_exports.number()]).nullish()
   })
 });
-var openaiFailedResponseHandler = createJsonErrorResponseHandler({
-  errorSchema: openaiErrorDataSchema,
+var defaultOpenAICompatibleErrorStructure = {
+  errorSchema: openaiCompatibleErrorDataSchema,
   errorToMessage: /* @__PURE__ */ __name((data) => data.error.message, "errorToMessage")
-});
-function getOpenAILanguageModelCapabilities(modelId) {
-  const supportsFlexProcessing = modelId.startsWith("o3") || modelId.startsWith("o4-mini") || modelId.startsWith("gpt-5") && !modelId.startsWith("gpt-5-chat");
-  const supportsPriorityProcessing = modelId.startsWith("gpt-4") || modelId.startsWith("gpt-5-mini") || modelId.startsWith("gpt-5") && !modelId.startsWith("gpt-5-nano") && !modelId.startsWith("gpt-5-chat") || modelId.startsWith("o3") || modelId.startsWith("o4-mini");
-  const isReasoningModel = modelId.startsWith("o1") || modelId.startsWith("o3") || modelId.startsWith("o4-mini") || modelId.startsWith("gpt-5") && !modelId.startsWith("gpt-5-chat");
-  const supportsNonReasoningParameters = modelId.startsWith("gpt-5.1") || modelId.startsWith("gpt-5.2");
-  const systemMessageMode = isReasoningModel ? "developer" : "system";
-  return {
-    supportsFlexProcessing,
-    supportsPriorityProcessing,
-    isReasoningModel,
-    systemMessageMode,
-    supportsNonReasoningParameters
-  };
-}
-__name(getOpenAILanguageModelCapabilities, "getOpenAILanguageModelCapabilities");
-function convertOpenAIChatUsage(usage) {
+};
+function convertOpenAICompatibleChatUsage(usage) {
   var _a21, _b17, _c, _d, _e2, _f;
   if (usage == null) {
     return {
@@ -32593,13 +35687,13 @@ function convertOpenAIChatUsage(usage) {
   }
   const promptTokens = (_a21 = usage.prompt_tokens) != null ? _a21 : 0;
   const completionTokens = (_b17 = usage.completion_tokens) != null ? _b17 : 0;
-  const cachedTokens = (_d = (_c = usage.prompt_tokens_details) == null ? void 0 : _c.cached_tokens) != null ? _d : 0;
+  const cacheReadTokens = (_d = (_c = usage.prompt_tokens_details) == null ? void 0 : _c.cached_tokens) != null ? _d : 0;
   const reasoningTokens = (_f = (_e2 = usage.completion_tokens_details) == null ? void 0 : _e2.reasoning_tokens) != null ? _f : 0;
   return {
     inputTokens: {
       total: promptTokens,
-      noCache: promptTokens - cachedTokens,
-      cacheRead: cachedTokens,
+      noCache: promptTokens - cacheReadTokens,
+      cacheRead: cacheReadTokens,
       cacheWrite: void 0
     },
     outputTokens: {
@@ -32610,54 +35704,51 @@ function convertOpenAIChatUsage(usage) {
     raw: usage
   };
 }
-__name(convertOpenAIChatUsage, "convertOpenAIChatUsage");
-function convertToOpenAIChatMessages({
-  prompt,
-  systemMessageMode = "system"
-}) {
-  var _a21;
+__name(convertOpenAICompatibleChatUsage, "convertOpenAICompatibleChatUsage");
+function getOpenAIMetadata(message) {
+  var _a21, _b17;
+  return (_b17 = (_a21 = message == null ? void 0 : message.providerOptions) == null ? void 0 : _a21.openaiCompatible) != null ? _b17 : {};
+}
+__name(getOpenAIMetadata, "getOpenAIMetadata");
+function getAudioFormat(mediaType) {
+  switch (mediaType) {
+    case "audio/wav":
+      return "wav";
+    case "audio/mp3":
+    case "audio/mpeg":
+      return "mp3";
+    default:
+      return null;
+  }
+}
+__name(getAudioFormat, "getAudioFormat");
+function convertToOpenAICompatibleChatMessages(prompt) {
+  var _a21, _b17, _c;
   const messages = [];
-  const warnings = [];
-  for (const { role, content } of prompt) {
+  for (const { role, content, ...message } of prompt) {
+    const metadata = getOpenAIMetadata({ ...message });
     switch (role) {
       case "system": {
-        switch (systemMessageMode) {
-          case "system": {
-            messages.push({ role: "system", content });
-            break;
-          }
-          case "developer": {
-            messages.push({ role: "developer", content });
-            break;
-          }
-          case "remove": {
-            warnings.push({
-              type: "other",
-              message: "system messages are removed for this model"
-            });
-            break;
-          }
-          default: {
-            const _exhaustiveCheck = systemMessageMode;
-            throw new Error(
-              `Unsupported system message mode: ${_exhaustiveCheck}`
-            );
-          }
-        }
+        messages.push({ role: "system", content, ...metadata });
         break;
       }
       case "user": {
         if (content.length === 1 && content[0].type === "text") {
-          messages.push({ role: "user", content: content[0].text });
+          messages.push({
+            role: "user",
+            content: content[0].text,
+            ...getOpenAIMetadata(content[0])
+          });
           break;
         }
         messages.push({
           role: "user",
-          content: content.map((part, index) => {
-            var _a24, _b17, _c;
+          content: content.map((part) => {
+            var _a24;
+            const partMetadata = getOpenAIMetadata(part);
             switch (part.type) {
               case "text": {
-                return { type: "text", text: part.text };
+                return { type: "text", text: part.text, ...partMetadata };
               }
               case "file": {
                 if (part.mediaType.startsWith("image/")) {
@@ -32665,44 +35756,33 @@ function convertToOpenAIChatMessages({
                   return {
                     type: "image_url",
                     image_url: {
-                      url: part.data instanceof URL ? part.data.toString() : `data:${mediaType};base64,${convertToBase64(part.data)}`,
-                      // OpenAI specific extension: image detail
-                      detail: (_b17 = (_a24 = part.providerOptions) == null ? void 0 : _a24.openai) == null ? void 0 : _b17.imageDetail
-                    }
+                      url: part.data instanceof URL ? part.data.toString() : `data:${mediaType};base64,${convertToBase64(part.data)}`
+                    },
+                    ...partMetadata
                   };
-                } else if (part.mediaType.startsWith("audio/")) {
+                }
+                if (part.mediaType.startsWith("audio/")) {
                   if (part.data instanceof URL) {
                     throw new UnsupportedFunctionalityError({
                       functionality: "audio file parts with URLs"
                     });
                   }
-                  switch (part.mediaType) {
-                    case "audio/wav": {
-                      return {
-                        type: "input_audio",
-                        input_audio: {
-                          data: convertToBase64(part.data),
-                          format: "wav"
-                        }
-                      };
-                    }
-                    case "audio/mp3":
-                    case "audio/mpeg": {
-                      return {
-                        type: "input_audio",
-                        input_audio: {
-                          data: convertToBase64(part.data),
-                          format: "mp3"
-                        }
-                      };
-                    }
-                    default: {
-                      throw new UnsupportedFunctionalityError({
-                        functionality: `audio content parts with media type ${part.mediaType}`
-                      });
-                    }
+                  const format = getAudioFormat(part.mediaType);
+                  if (format === null) {
+                    throw new UnsupportedFunctionalityError({
+                      functionality: `audio media type ${part.mediaType}`
+                    });
                   }
-                } else if (part.mediaType === "application/pdf") {
+                  return {
+                    type: "input_audio",
+                    input_audio: {
+                      data: convertToBase64(part.data),
+                      format
+                    },
+                    ...partMetadata
+                  };
+                }
+                if (part.mediaType === "application/pdf") {
                   if (part.data instanceof URL) {
                     throw new UnsupportedFunctionalityError({
                       functionality: "PDF file parts with URLs"
@@ -32710,39 +35790,66 @@ function convertToOpenAIChatMessages({
                   }
                   return {
                     type: "file",
-                    file: typeof part.data === "string" && part.data.startsWith("file-") ? { file_id: part.data } : {
-                      filename: (_c = part.filename) != null ? _c : `part-${index}.pdf`,
+                    file: {
+                      filename: (_a24 = part.filename) != null ? _a24 : "document.pdf",
                       file_data: `data:application/pdf;base64,${convertToBase64(part.data)}`
-                    }
+                    },
+                    ...partMetadata
                   };
-                } else {
-                  throw new UnsupportedFunctionalityError({
-                    functionality: `file part media type ${part.mediaType}`
-                  });
                 }
+                if (part.mediaType.startsWith("text/")) {
+                  const textContent = part.data instanceof URL ? part.data.toString() : typeof part.data === "string" ? new TextDecoder().decode(
+                    convertBase64ToUint8Array(part.data)
+                  ) : new TextDecoder().decode(part.data);
+                  return {
+                    type: "text",
+                    text: textContent,
+                    ...partMetadata
+                  };
+                }
+                throw new UnsupportedFunctionalityError({
+                  functionality: `file part media type ${part.mediaType}`
+                });
               }
             }
-          })
+          }),
+          ...metadata
         });
         break;
       }
       case "assistant": {
         let text2 = "";
+        let reasoning = "";
         const toolCalls = [];
         for (const part of content) {
+          const partMetadata = getOpenAIMetadata(part);
           switch (part.type) {
             case "text": {
               text2 += part.text;
               break;
             }
+            case "reasoning": {
+              reasoning += part.text;
+              break;
+            }
             case "tool-call": {
+              const thoughtSignature = (_b17 = (_a21 = part.providerOptions) == null ? void 0 : _a21.google) == null ? void 0 : _b17.thoughtSignature;
               toolCalls.push({
                 id: part.toolCallId,
                 type: "function",
                 function: {
                   name: part.toolName,
                   arguments: JSON.stringify(part.input)
-                }
+                },
+                ...partMetadata,
+                // Include extra_content for Google Gemini thought signatures
+                ...thoughtSignature ? {
+                  extra_content: {
+                    google: {
+                      thought_signature: String(thoughtSignature)
+                    }
+                  }
+                } : {}
               });
               break;
             }
@@ -32751,7 +35858,9 @@ function convertToOpenAIChatMessages({
         messages.push({
           role: "assistant",
           content: text2,
-          tool_calls: toolCalls.length > 0 ? toolCalls : void 0
+          ...reasoning.length > 0 ? { reasoning_content: reasoning } : {},
+          tool_calls: toolCalls.length > 0 ? toolCalls : void 0,
+          ...metadata
         });
         break;
       }
@@ -32768,7 +35877,7 @@ function convertToOpenAIChatMessages({
               contentValue = output.value;
               break;
             case "execution-denied":
-              contentValue = (_a21 = output.reason) != null ? _a21 : "Tool execution denied.";
+              contentValue = (_c = output.reason) != null ? _c : "Tool execution denied.";
               break;
             case "content":
             case "json":
@@ -32776,10 +35885,12 @@ function convertToOpenAIChatMessages({
               contentValue = JSON.stringify(output.value);
               break;
           }
+          const toolResponseMetadata = getOpenAIMetadata(toolResponse);
           messages.push({
             role: "tool",
             tool_call_id: toolResponse.toolCallId,
-            content: contentValue
+            content: contentValue,
+            ...toolResponseMetadata
           });
         }
         break;
@@ -32790,9 +35901,9 @@ function convertToOpenAIChatMessages({
       }
     }
   }
-  return { messages, warnings };
+  return messages;
 }
-__name(convertToOpenAIChatMessages, "convertToOpenAIChatMessages");
+__name(convertToOpenAICompatibleChatMessages, "convertToOpenAICompatibleChatMessages");
 function getResponseMetadata({
   id,
   model,
@@ -32801,11 +35912,11 @@ function getResponseMetadata({
   return {
     id: id != null ? id : void 0,
     modelId: model != null ? model : void 0,
-    timestamp: created ? new Date(created * 1e3) : void 0
+    timestamp: created != null ? new Date(created * 1e3) : void 0
   };
 }
 __name(getResponseMetadata, "getResponseMetadata");
-function mapOpenAIFinishReason(finishReason) {
+function mapOpenAICompatibleFinishReason(finishReason) {
   switch (finishReason) {
     case "stop":
       return "stop";
@@ -32820,261 +35931,31 @@ function mapOpenAIFinishReason(finishReason) {
       return "other";
   }
 }
-__name(mapOpenAIFinishReason, "mapOpenAIFinishReason");
-var openaiChatResponseSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      id: external_exports.string().nullish(),
-      created: external_exports.number().nullish(),
-      model: external_exports.string().nullish(),
-      choices: external_exports.array(
-        external_exports.object({
-          message: external_exports.object({
-            role: external_exports.literal("assistant").nullish(),
-            content: external_exports.string().nullish(),
-            tool_calls: external_exports.array(
-              external_exports.object({
-                id: external_exports.string().nullish(),
-                type: external_exports.literal("function"),
-                function: external_exports.object({
-                  name: external_exports.string(),
-                  arguments: external_exports.string()
-                })
-              })
-            ).nullish(),
-            annotations: external_exports.array(
-              external_exports.object({
-                type: external_exports.literal("url_citation"),
-                url_citation: external_exports.object({
-                  start_index: external_exports.number(),
-                  end_index: external_exports.number(),
-                  url: external_exports.string(),
-                  title: external_exports.string()
-                })
-              })
-            ).nullish()
-          }),
-          index: external_exports.number().nullish(),
-          logprobs: external_exports.object({
-            content: external_exports.array(
-              external_exports.object({
-                token: external_exports.string(),
-                logprob: external_exports.number(),
-                top_logprobs: external_exports.array(
-                  external_exports.object({
-                    token: external_exports.string(),
-                    logprob: external_exports.number()
-                  })
-                )
-              })
-            ).nullish()
-          }).nullish(),
-          finish_reason: external_exports.string().nullish()
-        })
-      ),
-      usage: external_exports.object({
-        prompt_tokens: external_exports.number().nullish(),
-        completion_tokens: external_exports.number().nullish(),
-        total_tokens: external_exports.number().nullish(),
-        prompt_tokens_details: external_exports.object({
-          cached_tokens: external_exports.number().nullish()
-        }).nullish(),
-        completion_tokens_details: external_exports.object({
-          reasoning_tokens: external_exports.number().nullish(),
-          accepted_prediction_tokens: external_exports.number().nullish(),
-          rejected_prediction_tokens: external_exports.number().nullish()
-        }).nullish()
-      }).nullish()
-    })
-  )
-);
-var openaiChatChunkSchema = lazySchema(
-  () => zodSchema(
-    external_exports.union([
-      external_exports.object({
-        id: external_exports.string().nullish(),
-        created: external_exports.number().nullish(),
-        model: external_exports.string().nullish(),
-        choices: external_exports.array(
-          external_exports.object({
-            delta: external_exports.object({
-              role: external_exports.enum(["assistant"]).nullish(),
-              content: external_exports.string().nullish(),
-              tool_calls: external_exports.array(
-                external_exports.object({
-                  index: external_exports.number(),
-                  id: external_exports.string().nullish(),
-                  type: external_exports.literal("function").nullish(),
-                  function: external_exports.object({
-                    name: external_exports.string().nullish(),
-                    arguments: external_exports.string().nullish()
-                  })
-                })
-              ).nullish(),
-              annotations: external_exports.array(
-                external_exports.object({
-                  type: external_exports.literal("url_citation"),
-                  url_citation: external_exports.object({
-                    start_index: external_exports.number(),
-                    end_index: external_exports.number(),
-                    url: external_exports.string(),
-                    title: external_exports.string()
-                  })
-                })
-              ).nullish()
-            }).nullish(),
-            logprobs: external_exports.object({
-              content: external_exports.array(
-                external_exports.object({
-                  token: external_exports.string(),
-                  logprob: external_exports.number(),
-                  top_logprobs: external_exports.array(
-                    external_exports.object({
-                      token: external_exports.string(),
-                      logprob: external_exports.number()
-                    })
-                  )
-                })
-              ).nullish()
-            }).nullish(),
-            finish_reason: external_exports.string().nullish(),
-            index: external_exports.number()
-          })
-        ),
-        usage: external_exports.object({
-          prompt_tokens: external_exports.number().nullish(),
-          completion_tokens: external_exports.number().nullish(),
-          total_tokens: external_exports.number().nullish(),
-          prompt_tokens_details: external_exports.object({
-            cached_tokens: external_exports.number().nullish()
-          }).nullish(),
-          completion_tokens_details: external_exports.object({
-            reasoning_tokens: external_exports.number().nullish(),
-            accepted_prediction_tokens: external_exports.number().nullish(),
-            rejected_prediction_tokens: external_exports.number().nullish()
-          }).nullish()
-        }).nullish()
-      }),
-      openaiErrorDataSchema
-    ])
-  )
-);
-var openaiLanguageModelChatOptions = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      /**
-       * Modify the likelihood of specified tokens appearing in the completion.
-       *
-       * Accepts a JSON object that maps tokens (specified by their token ID in
-       * the GPT tokenizer) to an associated bias value from -100 to 100.
-       */
-      logitBias: external_exports.record(external_exports.coerce.number(), external_exports.number()).optional(),
-      /**
-       * Return the log probabilities of the tokens.
-       *
-       * Setting to true will return the log probabilities of the tokens that
-       * were generated.
-       *
-       * Setting to a number will return the log probabilities of the top n
-       * tokens that were generated.
-       */
-      logprobs: external_exports.union([external_exports.boolean(), external_exports.number()]).optional(),
-      /**
-       * Whether to enable parallel function calling during tool use. Default to true.
-       */
-      parallelToolCalls: external_exports.boolean().optional(),
-      /**
-       * A unique identifier representing your end-user, which can help OpenAI to
-       * monitor and detect abuse.
-       */
-      user: external_exports.string().optional(),
-      /**
-       * Reasoning effort for reasoning models. Defaults to `medium`.
-       */
-      reasoningEffort: external_exports.enum(["none", "minimal", "low", "medium", "high", "xhigh"]).optional(),
-      /**
-       * Maximum number of completion tokens to generate. Useful for reasoning models.
-       */
-      maxCompletionTokens: external_exports.number().optional(),
-      /**
-       * Whether to enable persistence in responses API.
-       */
-      store: external_exports.boolean().optional(),
-      /**
-       * Metadata to associate with the request.
-       */
-      metadata: external_exports.record(external_exports.string().max(64), external_exports.string().max(512)).optional(),
-      /**
-       * Parameters for prediction mode.
-       */
-      prediction: external_exports.record(external_exports.string(), external_exports.any()).optional(),
-      /**
-       * Service tier for the request.
-       * - 'auto': Default service tier. The request will be processed with the service tier configured in the
-       *           Project settings. Unless otherwise configured, the Project will use 'default'.
-       * - 'flex': 50% cheaper processing at the cost of increased latency. Only available for o3 and o4-mini models.
-       * - 'priority': Higher-speed processing with predictably low latency at premium cost. Available for Enterprise customers.
-       * - 'default': The request will be processed with the standard pricing and performance for the selected model.
-       *
-       * @default 'auto'
-       */
-      serviceTier: external_exports.enum(["auto", "flex", "priority", "default"]).optional(),
-      /**
-       * Whether to use strict JSON schema validation.
-       *
-       * @default true
-       */
-      strictJsonSchema: external_exports.boolean().optional(),
-      /**
-       * Controls the verbosity of the model's responses.
-       * Lower values will result in more concise responses, while higher values will result in more verbose responses.
-       */
-      textVerbosity: external_exports.enum(["low", "medium", "high"]).optional(),
-      /**
-       * A cache key for prompt caching. Allows manual control over prompt caching behavior.
-       * Useful for improving cache hit rates and working around automatic caching issues.
-       */
-      promptCacheKey: external_exports.string().optional(),
-      /**
-       * The retention policy for the prompt cache.
-       * - 'in_memory': Default. Standard prompt caching behavior.
-       * - '24h': Extended prompt caching that keeps cached prefixes active for up to 24 hours.
-       *          Currently only available for 5.1 series models.
-       *
-       * @default 'in_memory'
-       */
-      promptCacheRetention: external_exports.enum(["in_memory", "24h"]).optional(),
-      /**
-       * A stable identifier used to help detect users of your application
-       * that may be violating OpenAI's usage policies. The IDs should be a
-       * string that uniquely identifies each user. We recommend hashing their
-       * username or email address, in order to avoid sending us any identifying
-       * information.
-       */
-      safetyIdentifier: external_exports.string().optional(),
-      /**
-       * Override the system message mode for this model.
-       * - 'system': Use the 'system' role for system messages (default for most models)
-       * - 'developer': Use the 'developer' role for system messages (used by reasoning models)
-       * - 'remove': Remove system messages entirely
-       *
-       * If not specified, the mode is automatically determined based on the model.
-       */
-      systemMessageMode: external_exports.enum(["system", "developer", "remove"]).optional(),
-      /**
-       * Force treating this model as a reasoning model.
-       *
-       * This is useful for "stealth" reasoning models (e.g. via a custom baseURL)
-       * where the model ID is not recognized by the SDK's allowlist.
-       *
-       * When enabled, the SDK applies reasoning-model parameter compatibility rules
-       * and defaults `systemMessageMode` to `developer` unless overridden.
-       */
-      forceReasoning: external_exports.boolean().optional()
-    })
-  )
-);
-function prepareChatTools({
+__name(mapOpenAICompatibleFinishReason, "mapOpenAICompatibleFinishReason");
+var openaiCompatibleLanguageModelChatOptions = external_exports.object({
+  /**
+   * A unique identifier representing your end-user, which can help the provider to
+   * monitor and detect abuse.
+   */
+  user: external_exports.string().optional(),
+  /**
+   * Reasoning effort for reasoning models. Defaults to `medium`.
+   */
+  reasoningEffort: external_exports.string().optional(),
+  /**
+   * Controls the verbosity of the generated text. Defaults to `medium`.
+   */
+  textVerbosity: external_exports.string().optional(),
+  /**
+   * Whether to use strict JSON schema validation.
+   * When true, the model uses constrained decoding to guarantee schema compliance.
+   * Only used when the provider supports structured outputs and a schema is provided.
+   *
+   * @default true
+   */
+  strictJsonSchema: external_exports.boolean().optional()
+});
+function prepareTools({
   tools,
   toolChoice
 }) {
@@ -33083,45 +35964,40 @@ function prepareChatTools({
   if (tools == null) {
     return { tools: void 0, toolChoice: void 0, toolWarnings };
   }
-  const openaiTools2 = [];
+  const openaiCompatTools = [];
   for (const tool2 of tools) {
-    switch (tool2.type) {
-      case "function":
-        openaiTools2.push({
-          type: "function",
-          function: {
-            name: tool2.name,
-            description: tool2.description,
-            parameters: tool2.inputSchema,
-            ...tool2.strict != null ? { strict: tool2.strict } : {}
-          }
-        });
-        break;
-      default:
-        toolWarnings.push({
-          type: "unsupported",
-          feature: `tool type: ${tool2.type}`
-        });
-        break;
+    if (tool2.type === "provider") {
+      toolWarnings.push({
+        type: "unsupported",
+        feature: `provider-defined tool ${tool2.id}`
+      });
+    } else {
+      openaiCompatTools.push({
+        type: "function",
+        function: {
+          name: tool2.name,
+          description: tool2.description,
+          parameters: tool2.inputSchema,
+          ...tool2.strict != null ? { strict: tool2.strict } : {}
+        }
+      });
     }
   }
   if (toolChoice == null) {
-    return { tools: openaiTools2, toolChoice: void 0, toolWarnings };
+    return { tools: openaiCompatTools, toolChoice: void 0, toolWarnings };
   }
   const type = toolChoice.type;
   switch (type) {
     case "auto":
     case "none":
     case "required":
-      return { tools: openaiTools2, toolChoice: type, toolWarnings };
+      return { tools: openaiCompatTools, toolChoice: type, toolWarnings };
     case "tool":
       return {
-        tools: openaiTools2,
+        tools: openaiCompatTools,
         toolChoice: {
           type: "function",
-          function: {
-            name: toolChoice.toolName
-          }
+          function: { name: toolChoice.toolName }
         },
         toolWarnings
       };
@@ -33133,21 +36009,37 @@ function prepareChatTools({
     }
   }
 }
-__name(prepareChatTools, "prepareChatTools");
-var OpenAIChatLanguageModel = class {
+__name(prepareTools, "prepareTools");
+var OpenAICompatibleChatLanguageModel = class {
   static {
-    __name(this, "OpenAIChatLanguageModel");
+    __name(this, "OpenAICompatibleChatLanguageModel");
   }
+  // type inferred via constructor
   constructor(modelId, config2) {
     this.specificationVersion = "v3";
-    this.supportedUrls = {
-      "image/*": [/^https?:\/\/.*$/]
-    };
+    var _a21, _b17;
     this.modelId = modelId;
     this.config = config2;
+    const errorStructure = (_a21 = config2.errorStructure) != null ? _a21 : defaultOpenAICompatibleErrorStructure;
+    this.chunkSchema = createOpenAICompatibleChatChunkSchema(
+      errorStructure.errorSchema
+    );
+    this.failedResponseHandler = createJsonErrorResponseHandler(errorStructure);
+    this.supportsStructuredOutputs = (_b17 = config2.supportsStructuredOutputs) != null ? _b17 : false;
   }
   get provider() {
     return this.config.provider;
+  }
+  get providerOptionsName() {
+    return this.config.provider.split(".")[0].trim();
+  }
+  get supportedUrls() {
+    var _a21, _b17, _c;
+    return (_c = (_b17 = (_a21 = this.config).supportedUrls) == null ? void 0 : _b17.call(_a21)) != null ? _c : {};
+  }
+  transformRequestBody(args) {
+    var _a21, _b17, _c;
+    return (_c = (_b17 = (_a21 = this.config).transformRequestBody) == null ? void 0 : _b17.call(_a21, args)) != null ? _c : args;
   }
   async getArgs({
     prompt,
@@ -33157,185 +36049,109 @@ var OpenAIChatLanguageModel = class {
     topK,
     frequencyPenalty,
     presencePenalty,
+    providerOptions,
     stopSequences,
     responseFormat,
     seed,
-    tools,
     toolChoice,
-    providerOptions
+    tools
   }) {
     var _a21, _b17, _c, _d, _e2;
     const warnings = [];
-    const openaiOptions = (_a21 = await parseProviderOptions({
-      provider: "openai",
+    const deprecatedOptions = await parseProviderOptions({
+      provider: "openai-compatible",
       providerOptions,
-      schema: openaiLanguageModelChatOptions
-    })) != null ? _a21 : {};
-    const modelCapabilities = getOpenAILanguageModelCapabilities(this.modelId);
-    const isReasoningModel = (_b17 = openaiOptions.forceReasoning) != null ? _b17 : modelCapabilities.isReasoningModel;
+      schema: openaiCompatibleLanguageModelChatOptions
+    });
+    if (deprecatedOptions != null) {
+      warnings.push({
+        type: "other",
+        message: `The 'openai-compatible' key in providerOptions is deprecated. Use 'openaiCompatible' instead.`
+      });
+    }
+    const compatibleOptions = Object.assign(
+      deprecatedOptions != null ? deprecatedOptions : {},
+      (_a21 = await parseProviderOptions({
+        provider: "openaiCompatible",
+        providerOptions,
+        schema: openaiCompatibleLanguageModelChatOptions
+      })) != null ? _a21 : {},
+      (_b17 = await parseProviderOptions({
+        provider: this.providerOptionsName,
+        providerOptions,
+        schema: openaiCompatibleLanguageModelChatOptions
+      })) != null ? _b17 : {}
+    );
+    const strictJsonSchema = (_c = compatibleOptions == null ? void 0 : compatibleOptions.strictJsonSchema) != null ? _c : true;
     if (topK != null) {
       warnings.push({ type: "unsupported", feature: "topK" });
     }
-    const { messages, warnings: messageWarnings } = convertToOpenAIChatMessages(
-      {
-        prompt,
-        systemMessageMode: (_c = openaiOptions.systemMessageMode) != null ? _c : isReasoningModel ? "developer" : modelCapabilities.systemMessageMode
-      }
-    );
-    warnings.push(...messageWarnings);
-    const strictJsonSchema = (_d = openaiOptions.strictJsonSchema) != null ? _d : true;
-    const baseArgs = {
-      // model id:
-      model: this.modelId,
-      // model specific settings:
-      logit_bias: openaiOptions.logitBias,
-      logprobs: openaiOptions.logprobs === true || typeof openaiOptions.logprobs === "number" ? true : void 0,
-      top_logprobs: typeof openaiOptions.logprobs === "number" ? openaiOptions.logprobs : typeof openaiOptions.logprobs === "boolean" ? openaiOptions.logprobs ? 0 : void 0 : void 0,
-      user: openaiOptions.user,
-      parallel_tool_calls: openaiOptions.parallelToolCalls,
-      // standardized settings:
-      max_tokens: maxOutputTokens,
-      temperature,
-      top_p: topP,
-      frequency_penalty: frequencyPenalty,
-      presence_penalty: presencePenalty,
-      response_format: (responseFormat == null ? void 0 : responseFormat.type) === "json" ? responseFormat.schema != null ? {
-        type: "json_schema",
-        json_schema: {
-          schema: responseFormat.schema,
-          strict: strictJsonSchema,
-          name: (_e2 = responseFormat.name) != null ? _e2 : "response",
-          description: responseFormat.description
-        }
-      } : { type: "json_object" } : void 0,
-      stop: stopSequences,
-      seed,
-      verbosity: openaiOptions.textVerbosity,
-      // openai specific settings:
-      // TODO AI SDK 6: remove, we auto-map maxOutputTokens now
-      max_completion_tokens: openaiOptions.maxCompletionTokens,
-      store: openaiOptions.store,
-      metadata: openaiOptions.metadata,
-      prediction: openaiOptions.prediction,
-      reasoning_effort: openaiOptions.reasoningEffort,
-      service_tier: openaiOptions.serviceTier,
-      prompt_cache_key: openaiOptions.promptCacheKey,
-      prompt_cache_retention: openaiOptions.promptCacheRetention,
-      safety_identifier: openaiOptions.safetyIdentifier,
-      // messages:
-      messages
-    };
-    if (isReasoningModel) {
-      if (openaiOptions.reasoningEffort !== "none" || !modelCapabilities.supportsNonReasoningParameters) {
-        if (baseArgs.temperature != null) {
-          baseArgs.temperature = void 0;
-          warnings.push({
-            type: "unsupported",
-            feature: "temperature",
-            details: "temperature is not supported for reasoning models"
-          });
-        }
-        if (baseArgs.top_p != null) {
-          baseArgs.top_p = void 0;
-          warnings.push({
-            type: "unsupported",
-            feature: "topP",
-            details: "topP is not supported for reasoning models"
-          });
-        }
-        if (baseArgs.logprobs != null) {
-          baseArgs.logprobs = void 0;
-          warnings.push({
-            type: "other",
-            message: "logprobs is not supported for reasoning models"
-          });
-        }
-      }
-      if (baseArgs.frequency_penalty != null) {
-        baseArgs.frequency_penalty = void 0;
-        warnings.push({
-          type: "unsupported",
-          feature: "frequencyPenalty",
-          details: "frequencyPenalty is not supported for reasoning models"
-        });
-      }
-      if (baseArgs.presence_penalty != null) {
-        baseArgs.presence_penalty = void 0;
-        warnings.push({
-          type: "unsupported",
-          feature: "presencePenalty",
-          details: "presencePenalty is not supported for reasoning models"
-        });
-      }
-      if (baseArgs.logit_bias != null) {
-        baseArgs.logit_bias = void 0;
-        warnings.push({
-          type: "other",
-          message: "logitBias is not supported for reasoning models"
-        });
-      }
-      if (baseArgs.top_logprobs != null) {
-        baseArgs.top_logprobs = void 0;
-        warnings.push({
-          type: "other",
-          message: "topLogprobs is not supported for reasoning models"
-        });
-      }
-      if (baseArgs.max_tokens != null) {
-        if (baseArgs.max_completion_tokens == null) {
-          baseArgs.max_completion_tokens = baseArgs.max_tokens;
-        }
-        baseArgs.max_tokens = void 0;
-      }
-    } else if (this.modelId.startsWith("gpt-4o-search-preview") || this.modelId.startsWith("gpt-4o-mini-search-preview")) {
-      if (baseArgs.temperature != null) {
-        baseArgs.temperature = void 0;
-        warnings.push({
-          type: "unsupported",
-          feature: "temperature",
-          details: "temperature is not supported for the search preview models and has been removed."
-        });
-      }
-    }
-    if (openaiOptions.serviceTier === "flex" && !modelCapabilities.supportsFlexProcessing) {
+    if ((responseFormat == null ? void 0 : responseFormat.type) === "json" && responseFormat.schema != null && !this.supportsStructuredOutputs) {
       warnings.push({
         type: "unsupported",
-        feature: "serviceTier",
-        details: "flex processing is only available for o3, o4-mini, and gpt-5 models"
+        feature: "responseFormat",
+        details: "JSON response format schema is only supported with structuredOutputs"
       });
-      baseArgs.service_tier = void 0;
-    }
-    if (openaiOptions.serviceTier === "priority" && !modelCapabilities.supportsPriorityProcessing) {
-      warnings.push({
-        type: "unsupported",
-        feature: "serviceTier",
-        details: "priority processing is only available for supported models (gpt-4, gpt-5, gpt-5-mini, o3, o4-mini) and requires Enterprise access. gpt-5-nano is not supported"
-      });
-      baseArgs.service_tier = void 0;
     }
     const {
-      tools: openaiTools2,
+      tools: openaiTools,
       toolChoice: openaiToolChoice,
       toolWarnings
-    } = prepareChatTools({
+    } = prepareTools({
       tools,
       toolChoice
     });
     return {
       args: {
-        ...baseArgs,
-        tools: openaiTools2,
+        // model id:
+        model: this.modelId,
+        // model specific settings:
+        user: compatibleOptions.user,
+        // standardized settings:
+        max_tokens: maxOutputTokens,
+        temperature,
+        top_p: topP,
+        frequency_penalty: frequencyPenalty,
+        presence_penalty: presencePenalty,
+        response_format: (responseFormat == null ? void 0 : responseFormat.type) === "json" ? this.supportsStructuredOutputs === true && responseFormat.schema != null ? {
+          type: "json_schema",
+          json_schema: {
+            schema: responseFormat.schema,
+            strict: strictJsonSchema,
+            name: (_d = responseFormat.name) != null ? _d : "response",
+            description: responseFormat.description
+          }
+        } : { type: "json_object" } : void 0,
+        stop: stopSequences,
+        seed,
+        ...Object.fromEntries(
+          Object.entries(
+            (_e2 = providerOptions == null ? void 0 : providerOptions[this.providerOptionsName]) != null ? _e2 : {}
+          ).filter(
+            ([key]) => !Object.keys(
+              openaiCompatibleLanguageModelChatOptions.shape
+            ).includes(key)
+          )
+        ),
+        reasoning_effort: compatibleOptions.reasoningEffort,
+        verbosity: compatibleOptions.textVerbosity,
+        // messages:
+        messages: convertToOpenAICompatibleChatMessages(prompt),
+        // tools:
+        tools: openaiTools,
         tool_choice: openaiToolChoice
       },
       warnings: [...warnings, ...toolWarnings]
     };
   }
   async doGenerate(options) {
-    var _a21, _b17, _c, _d, _e2, _f, _g;
-    const { args: body, warnings } = await this.getArgs(options);
+    var _a21, _b17, _c, _d, _e2, _f, _g, _h;
+    const { args, warnings } = await this.getArgs({ ...options });
+    const transformedBody = this.transformRequestBody(args);
+    const body = JSON.stringify(transformedBody);
     const {
       responseHeaders,
-      value: response,
+      value: responseBody,
       rawValue: rawResponse
     } = await postJsonToApi({
       url: this.config.url({
@@ -33343,75 +36159,83 @@ var OpenAIChatLanguageModel = class {
         modelId: this.modelId
       }),
       headers: combineHeaders(this.config.headers(), options.headers),
-      body,
-      failedResponseHandler: openaiFailedResponseHandler,
+      body: transformedBody,
+      failedResponseHandler: this.failedResponseHandler,
       successfulResponseHandler: createJsonResponseHandler(
-        openaiChatResponseSchema
+        OpenAICompatibleChatResponseSchema
       ),
       abortSignal: options.abortSignal,
       fetch: this.config.fetch
     });
-    const choice2 = response.choices[0];
+    const choice2 = responseBody.choices[0];
     const content = [];
     const text2 = choice2.message.content;
     if (text2 != null && text2.length > 0) {
       content.push({ type: "text", text: text2 });
     }
-    for (const toolCall of (_a21 = choice2.message.tool_calls) != null ? _a21 : []) {
+    const reasoning = (_a21 = choice2.message.reasoning_content) != null ? _a21 : choice2.message.reasoning;
+    if (reasoning != null && reasoning.length > 0) {
       content.push({
-        type: "tool-call",
-        toolCallId: (_b17 = toolCall.id) != null ? _b17 : generateId(),
-        toolName: toolCall.function.name,
-        input: toolCall.function.arguments
+        type: "reasoning",
+        text: reasoning
       });
     }
-    for (const annotation of (_c = choice2.message.annotations) != null ? _c : []) {
-      content.push({
-        type: "source",
-        sourceType: "url",
-        id: generateId(),
-        url: annotation.url_citation.url,
-        title: annotation.url_citation.title
-      });
+    if (choice2.message.tool_calls != null) {
+      for (const toolCall of choice2.message.tool_calls) {
+        const thoughtSignature = (_c = (_b17 = toolCall.extra_content) == null ? void 0 : _b17.google) == null ? void 0 : _c.thought_signature;
+        content.push({
+          type: "tool-call",
+          toolCallId: (_d = toolCall.id) != null ? _d : generateId(),
+          toolName: toolCall.function.name,
+          input: toolCall.function.arguments,
+          ...thoughtSignature ? {
+            providerMetadata: {
+              [this.providerOptionsName]: { thoughtSignature }
+            }
+          } : {}
+        });
+      }
     }
-    const completionTokenDetails = (_d = response.usage) == null ? void 0 : _d.completion_tokens_details;
-    const promptTokenDetails = (_e2 = response.usage) == null ? void 0 : _e2.prompt_tokens_details;
-    const providerMetadata = { openai: {} };
+    const providerMetadata = {
+      [this.providerOptionsName]: {},
+      ...await ((_f = (_e2 = this.config.metadataExtractor) == null ? void 0 : _e2.extractMetadata) == null ? void 0 : _f.call(_e2, {
+        parsedBody: rawResponse
+      }))
+    };
+    const completionTokenDetails = (_g = responseBody.usage) == null ? void 0 : _g.completion_tokens_details;
     if ((completionTokenDetails == null ? void 0 : completionTokenDetails.accepted_prediction_tokens) != null) {
-      providerMetadata.openai.acceptedPredictionTokens = completionTokenDetails == null ? void 0 : completionTokenDetails.accepted_prediction_tokens;
+      providerMetadata[this.providerOptionsName].acceptedPredictionTokens = completionTokenDetails == null ? void 0 : completionTokenDetails.accepted_prediction_tokens;
     }
     if ((completionTokenDetails == null ? void 0 : completionTokenDetails.rejected_prediction_tokens) != null) {
-      providerMetadata.openai.rejectedPredictionTokens = completionTokenDetails == null ? void 0 : completionTokenDetails.rejected_prediction_tokens;
-    }
-    if (((_f = choice2.logprobs) == null ? void 0 : _f.content) != null) {
-      providerMetadata.openai.logprobs = choice2.logprobs.content;
+      providerMetadata[this.providerOptionsName].rejectedPredictionTokens = completionTokenDetails == null ? void 0 : completionTokenDetails.rejected_prediction_tokens;
     }
     return {
       content,
       finishReason: {
-        unified: mapOpenAIFinishReason(choice2.finish_reason),
-        raw: (_g = choice2.finish_reason) != null ? _g : void 0
+        unified: mapOpenAICompatibleFinishReason(choice2.finish_reason),
+        raw: (_h = choice2.finish_reason) != null ? _h : void 0
       },
-      usage: convertOpenAIChatUsage(response.usage),
+      usage: convertOpenAICompatibleChatUsage(responseBody.usage),
+      providerMetadata,
       request: { body },
       response: {
-        ...getResponseMetadata(response),
+        ...getResponseMetadata(responseBody),
         headers: responseHeaders,
         body: rawResponse
       },
-      warnings,
-      providerMetadata
+      warnings
     };
   }
   async doStream(options) {
-    const { args, warnings } = await this.getArgs(options);
-    const body = {
+    var _a21;
+    const { args, warnings } = await this.getArgs({ ...options });
+    const body = this.transformRequestBody({
       ...args,
       stream: true,
-      stream_options: {
-        include_usage: true
-      }
-    };
+      // only include stream_options when in strict compatibility mode:
+      stream_options: this.config.includeUsage ? { include_usage: true } : void 0
+    });
+    const metadataExtractor = (_a21 = this.config.metadataExtractor) == null ? void 0 : _a21.createStreamExtractor();
     const { responseHeaders, value: response } = await postJsonToApi({
       url: this.config.url({
         path: "/chat/completions",
@@ -33419,9 +36243,9 @@ var OpenAIChatLanguageModel = class {
       }),
       headers: combineHeaders(this.config.headers(), options.headers),
       body,
-      failedResponseHandler: openaiFailedResponseHandler,
+      failedResponseHandler: this.failedResponseHandler,
       successfulResponseHandler: createEventSourceResponseHandler(
-        openaiChatChunkSchema
+        this.chunkSchema
       ),
       abortSignal: options.abortSignal,
       fetch: this.config.fetch
@@ -33432,9 +36256,10 @@ var OpenAIChatLanguageModel = class {
       raw: void 0
     };
     let usage = void 0;
-    let metadataExtracted = false;
+    let isFirstChunk = true;
+    const providerOptionsName = this.providerOptionsName;
+    let isActiveReasoning = false;
     let isActiveText = false;
-    const providerMetadata = { openai: {} };
     return {
       stream: response.pipeThrough(
         new TransformStream({
@@ -33442,7 +36267,7 @@ var OpenAIChatLanguageModel = class {
             controller.enqueue({ type: "stream-start", warnings });
           },
           transform(chunk, controller) {
-            var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q;
+            var _a24, _b17, _c, _d, _e2, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r2;
             if (options.includeRawChunks) {
               controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
             }
@@ -33451,73 +36276,88 @@ var OpenAIChatLanguageModel = class {
               controller.enqueue({ type: "error", error: chunk.error });
               return;
             }
-            const value = chunk.value;
-            if ("error" in value) {
+            metadataExtractor == null ? void 0 : metadataExtractor.processChunk(chunk.rawValue);
+            if ("error" in chunk.value) {
               finishReason = { unified: "error", raw: void 0 };
-              controller.enqueue({ type: "error", error: value.error });
+              controller.enqueue({
+                type: "error",
+                error: chunk.value.error.message
+              });
               return;
             }
-            if (!metadataExtracted) {
-              const metadata = getResponseMetadata(value);
-              if (Object.values(metadata).some(Boolean)) {
-                metadataExtracted = true;
-                controller.enqueue({
-                  type: "response-metadata",
-                  ...getResponseMetadata(value)
-                });
-              }
+            const value = chunk.value;
+            if (isFirstChunk) {
+              isFirstChunk = false;
+              controller.enqueue({
+                type: "response-metadata",
+                ...getResponseMetadata(value)
+              });
             }
             if (value.usage != null) {
               usage = value.usage;
-              if (((_a21 = value.usage.completion_tokens_details) == null ? void 0 : _a21.accepted_prediction_tokens) != null) {
-                providerMetadata.openai.acceptedPredictionTokens = (_b17 = value.usage.completion_tokens_details) == null ? void 0 : _b17.accepted_prediction_tokens;
-              }
-              if (((_c = value.usage.completion_tokens_details) == null ? void 0 : _c.rejected_prediction_tokens) != null) {
-                providerMetadata.openai.rejectedPredictionTokens = (_d = value.usage.completion_tokens_details) == null ? void 0 : _d.rejected_prediction_tokens;
-              }
             }
             const choice2 = value.choices[0];
             if ((choice2 == null ? void 0 : choice2.finish_reason) != null) {
               finishReason = {
-                unified: mapOpenAIFinishReason(choice2.finish_reason),
-                raw: choice2.finish_reason
+                unified: mapOpenAICompatibleFinishReason(choice2.finish_reason),
+                raw: (_a24 = choice2.finish_reason) != null ? _a24 : void 0
               };
-            }
-            if (((_e2 = choice2 == null ? void 0 : choice2.logprobs) == null ? void 0 : _e2.content) != null) {
-              providerMetadata.openai.logprobs = choice2.logprobs.content;
             }
             if ((choice2 == null ? void 0 : choice2.delta) == null) {
               return;
             }
             const delta = choice2.delta;
-            if (delta.content != null) {
+            const reasoningContent = (_b17 = delta.reasoning_content) != null ? _b17 : delta.reasoning;
+            if (reasoningContent) {
+              if (!isActiveReasoning) {
+                controller.enqueue({
+                  type: "reasoning-start",
+                  id: "reasoning-0"
+                });
+                isActiveReasoning = true;
+              }
+              controller.enqueue({
+                type: "reasoning-delta",
+                id: "reasoning-0",
+                delta: reasoningContent
+              });
+            }
+            if (delta.content) {
+              if (isActiveReasoning) {
+                controller.enqueue({
+                  type: "reasoning-end",
+                  id: "reasoning-0"
+                });
+                isActiveReasoning = false;
+              }
               if (!isActiveText) {
-                controller.enqueue({ type: "text-start", id: "0" });
+                controller.enqueue({ type: "text-start", id: "txt-0" });
                 isActiveText = true;
               }
               controller.enqueue({
                 type: "text-delta",
-                id: "0",
+                id: "txt-0",
                 delta: delta.content
               });
             }
             if (delta.tool_calls != null) {
+              if (isActiveReasoning) {
+                controller.enqueue({
+                  type: "reasoning-end",
+                  id: "reasoning-0"
+                });
+                isActiveReasoning = false;
+              }
               for (const toolCallDelta of delta.tool_calls) {
-                const index = toolCallDelta.index;
+                const index = (_c = toolCallDelta.index) != null ? _c : toolCalls.length;
                 if (toolCalls[index] == null) {
-                  if (toolCallDelta.type != null && toolCallDelta.type !== "function") {
-                    throw new InvalidResponseDataError({
-                      data: toolCallDelta,
-                      message: `Expected 'function' type.`
-                    });
-                  }
                   if (toolCallDelta.id == null) {
                     throw new InvalidResponseDataError({
                       data: toolCallDelta,
                       message: `Expected 'id' to be a string.`
                     });
                   }
-                  if (((_f = toolCallDelta.function) == null ? void 0 : _f.name) == null) {
+                  if (((_d = toolCallDelta.function) == null ? void 0 : _d.name) == null) {
                     throw new InvalidResponseDataError({
                       data: toolCallDelta,
                       message: `Expected 'function.name' to be a string.`
@@ -33533,12 +36373,13 @@ var OpenAIChatLanguageModel = class {
                     type: "function",
                     function: {
                       name: toolCallDelta.function.name,
-                      arguments: (_g = toolCallDelta.function.arguments) != null ? _g : ""
+                      arguments: (_e2 = toolCallDelta.function.arguments) != null ? _e2 : ""
                     },
-                    hasFinished: false
+                    hasFinished: false,
+                    thoughtSignature: (_h = (_g = (_f = toolCallDelta.extra_content) == null ? void 0 : _f.google) == null ? void 0 : _g.thought_signature) != null ? _h : void 0
                   };
                   const toolCall2 = toolCalls[index];
-                  if (((_h = toolCall2.function) == null ? void 0 : _h.name) != null && ((_i = toolCall2.function) == null ? void 0 : _i.arguments) != null) {
+                  if (((_i = toolCall2.function) == null ? void 0 : _i.name) != null && ((_j = toolCall2.function) == null ? void 0 : _j.arguments) != null) {
                     if (toolCall2.function.arguments.length > 0) {
                       controller.enqueue({
                         type: "tool-input-delta",
@@ -33553,9 +36394,16 @@ var OpenAIChatLanguageModel = class {
                       });
                       controller.enqueue({
                         type: "tool-call",
-                        toolCallId: (_j = toolCall2.id) != null ? _j : generateId(),
+                        toolCallId: (_k = toolCall2.id) != null ? _k : generateId(),
                         toolName: toolCall2.function.name,
-                        input: toolCall2.function.arguments
+                        input: toolCall2.function.arguments,
+                        ...toolCall2.thoughtSignature ? {
+                          providerMetadata: {
+                            [providerOptionsName]: {
+                              thoughtSignature: toolCall2.thoughtSignature
+                            }
+                          }
+                        } : {}
                       });
                       toolCall2.hasFinished = true;
                     }
@@ -33566,50 +36414,81 @@ var OpenAIChatLanguageModel = class {
                 if (toolCall.hasFinished) {
                   continue;
                 }
-                if (((_k = toolCallDelta.function) == null ? void 0 : _k.arguments) != null) {
-                  toolCall.function.arguments += (_m = (_l = toolCallDelta.function) == null ? void 0 : _l.arguments) != null ? _m : "";
+                if (((_l = toolCallDelta.function) == null ? void 0 : _l.arguments) != null) {
+                  toolCall.function.arguments += (_n = (_m = toolCallDelta.function) == null ? void 0 : _m.arguments) != null ? _n : "";
                 }
                 controller.enqueue({
                   type: "tool-input-delta",
                   id: toolCall.id,
-                  delta: (_n = toolCallDelta.function.arguments) != null ? _n : ""
+                  delta: (_o = toolCallDelta.function.arguments) != null ? _o : ""
                 });
-                if (((_o = toolCall.function) == null ? void 0 : _o.name) != null && ((_p = toolCall.function) == null ? void 0 : _p.arguments) != null && isParsableJson(toolCall.function.arguments)) {
+                if (((_p = toolCall.function) == null ? void 0 : _p.name) != null && ((_q = toolCall.function) == null ? void 0 : _q.arguments) != null && isParsableJson(toolCall.function.arguments)) {
                   controller.enqueue({
                     type: "tool-input-end",
                     id: toolCall.id
                   });
                   controller.enqueue({
                     type: "tool-call",
-                    toolCallId: (_q = toolCall.id) != null ? _q : generateId(),
+                    toolCallId: (_r2 = toolCall.id) != null ? _r2 : generateId(),
                     toolName: toolCall.function.name,
-                    input: toolCall.function.arguments
+                    input: toolCall.function.arguments,
+                    ...toolCall.thoughtSignature ? {
+                      providerMetadata: {
+                        [providerOptionsName]: {
+                          thoughtSignature: toolCall.thoughtSignature
+                        }
+                      }
+                    } : {}
                   });
                   toolCall.hasFinished = true;
                 }
               }
             }
-            if (delta.annotations != null) {
-              for (const annotation of delta.annotations) {
-                controller.enqueue({
-                  type: "source",
-                  sourceType: "url",
-                  id: generateId(),
-                  url: annotation.url_citation.url,
-                  title: annotation.url_citation.title
-                });
-              }
-            }
           },
           flush(controller) {
+            var _a24, _b17, _c, _d, _e2;
+            if (isActiveReasoning) {
+              controller.enqueue({ type: "reasoning-end", id: "reasoning-0" });
+            }
             if (isActiveText) {
-              controller.enqueue({ type: "text-end", id: "0" });
+              controller.enqueue({ type: "text-end", id: "txt-0" });
+            }
+            for (const toolCall of toolCalls.filter(
+              (toolCall2) => !toolCall2.hasFinished
+            )) {
+              controller.enqueue({
+                type: "tool-input-end",
+                id: toolCall.id
+              });
+              controller.enqueue({
+                type: "tool-call",
+                toolCallId: (_a24 = toolCall.id) != null ? _a24 : generateId(),
+                toolName: toolCall.function.name,
+                input: toolCall.function.arguments,
+                ...toolCall.thoughtSignature ? {
+                  providerMetadata: {
+                    [providerOptionsName]: {
+                      thoughtSignature: toolCall.thoughtSignature
+                    }
+                  }
+                } : {}
+              });
+            }
+            const providerMetadata = {
+              [providerOptionsName]: {},
+              ...metadataExtractor == null ? void 0 : metadataExtractor.buildMetadata()
+            };
+            if (((_b17 = usage == null ? void 0 : usage.completion_tokens_details) == null ? void 0 : _b17.accepted_prediction_tokens) != null) {
+              providerMetadata[providerOptionsName].acceptedPredictionTokens = (_c = usage == null ? void 0 : usage.completion_tokens_details) == null ? void 0 : _c.accepted_prediction_tokens;
+            }
+            if (((_d = usage == null ? void 0 : usage.completion_tokens_details) == null ? void 0 : _d.rejected_prediction_tokens) != null) {
+              providerMetadata[providerOptionsName].rejectedPredictionTokens = (_e2 = usage == null ? void 0 : usage.completion_tokens_details) == null ? void 0 : _e2.rejected_prediction_tokens;
             }
             controller.enqueue({
               type: "finish",
               finishReason,
-              usage: convertOpenAIChatUsage(usage),
-              ...providerMetadata != null ? { providerMetadata } : {}
+              usage: convertOpenAICompatibleChatUsage(usage),
+              providerMetadata
             });
           }
         })
@@ -33619,8 +36498,90 @@ var OpenAIChatLanguageModel = class {
     };
   }
 };
-function convertOpenAICompletionUsage(usage) {
-  var _a21, _b17, _c, _d;
+var openaiCompatibleTokenUsageSchema = external_exports.looseObject({
+  prompt_tokens: external_exports.number().nullish(),
+  completion_tokens: external_exports.number().nullish(),
+  total_tokens: external_exports.number().nullish(),
+  prompt_tokens_details: external_exports.object({
+    cached_tokens: external_exports.number().nullish()
+  }).nullish(),
+  completion_tokens_details: external_exports.object({
+    reasoning_tokens: external_exports.number().nullish(),
+    accepted_prediction_tokens: external_exports.number().nullish(),
+    rejected_prediction_tokens: external_exports.number().nullish()
+  }).nullish()
+}).nullish();
+var OpenAICompatibleChatResponseSchema = external_exports.looseObject({
+  id: external_exports.string().nullish(),
+  created: external_exports.number().nullish(),
+  model: external_exports.string().nullish(),
+  choices: external_exports.array(
+    external_exports.object({
+      message: external_exports.object({
+        role: external_exports.literal("assistant").nullish(),
+        content: external_exports.string().nullish(),
+        reasoning_content: external_exports.string().nullish(),
+        reasoning: external_exports.string().nullish(),
+        tool_calls: external_exports.array(
+          external_exports.object({
+            id: external_exports.string().nullish(),
+            function: external_exports.object({
+              name: external_exports.string(),
+              arguments: external_exports.string()
+            }),
+            // Support for Google Gemini thought signatures via OpenAI compatibility
+            extra_content: external_exports.object({
+              google: external_exports.object({
+                thought_signature: external_exports.string().nullish()
+              }).nullish()
+            }).nullish()
+          })
+        ).nullish()
+      }),
+      finish_reason: external_exports.string().nullish()
+    })
+  ),
+  usage: openaiCompatibleTokenUsageSchema
+});
+var chunkBaseSchema = external_exports.looseObject({
+  id: external_exports.string().nullish(),
+  created: external_exports.number().nullish(),
+  model: external_exports.string().nullish(),
+  choices: external_exports.array(
+    external_exports.object({
+      delta: external_exports.object({
+        role: external_exports.enum(["assistant"]).nullish(),
+        content: external_exports.string().nullish(),
+        // Most openai-compatible models set `reasoning_content`, but some
+        // providers serving `gpt-oss` set `reasoning`. See #7866
+        reasoning_content: external_exports.string().nullish(),
+        reasoning: external_exports.string().nullish(),
+        tool_calls: external_exports.array(
+          external_exports.object({
+            index: external_exports.number().nullish(),
+            //google does not send index
+            id: external_exports.string().nullish(),
+            function: external_exports.object({
+              name: external_exports.string().nullish(),
+              arguments: external_exports.string().nullish()
+            }),
+            // Support for Google Gemini thought signatures via OpenAI compatibility
+            extra_content: external_exports.object({
+              google: external_exports.object({
+                thought_signature: external_exports.string().nullish()
+              }).nullish()
+            }).nullish()
+          })
+        ).nullish()
+      }).nullish(),
+      finish_reason: external_exports.string().nullish()
+    })
+  ),
+  usage: openaiCompatibleTokenUsageSchema
+});
+var createOpenAICompatibleChatChunkSchema = /* @__PURE__ */ __name((errorSchema) => external_exports.union([chunkBaseSchema, errorSchema]), "createOpenAICompatibleChatChunkSchema");
+function convertOpenAICompatibleCompletionUsage(usage) {
+  var _a21, _b17;
   if (usage == null) {
     return {
       inputTokens: {
@@ -33641,21 +36602,21 @@ function convertOpenAICompletionUsage(usage) {
   const completionTokens = (_b17 = usage.completion_tokens) != null ? _b17 : 0;
   return {
     inputTokens: {
-      total: (_c = usage.prompt_tokens) != null ? _c : void 0,
+      total: promptTokens,
       noCache: promptTokens,
       cacheRead: void 0,
       cacheWrite: void 0
     },
     outputTokens: {
-      total: (_d = usage.completion_tokens) != null ? _d : void 0,
+      total: completionTokens,
       text: completionTokens,
       reasoning: void 0
     },
     raw: usage
   };
 }
-__name(convertOpenAICompletionUsage, "convertOpenAICompletionUsage");
-function convertToOpenAICompletionPrompt({
+__name(convertOpenAICompatibleCompletionUsage, "convertOpenAICompatibleCompletionUsage");
+function convertToOpenAICompatibleCompletionPrompt({
   prompt,
   user = "user",
   assistant = "assistant"
@@ -33727,7 +36688,7 @@ ${assistantMessage}
 ${user}:`]
   };
 }
-__name(convertToOpenAICompletionPrompt, "convertToOpenAICompletionPrompt");
+__name(convertToOpenAICompatibleCompletionPrompt, "convertToOpenAICompatibleCompletionPrompt");
 function getResponseMetadata2({
   id,
   model,
@@ -33740,7 +36701,7 @@ function getResponseMetadata2({
   };
 }
 __name(getResponseMetadata2, "getResponseMetadata2");
-function mapOpenAIFinishReason2(finishReason) {
+function mapOpenAICompatibleFinishReason2(finishReason) {
   switch (finishReason) {
     case "stop":
       return "stop";
@@ -33755,122 +36716,54 @@ function mapOpenAIFinishReason2(finishReason) {
       return "other";
   }
 }
-__name(mapOpenAIFinishReason2, "mapOpenAIFinishReason2");
-var openaiCompletionResponseSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      id: external_exports.string().nullish(),
-      created: external_exports.number().nullish(),
-      model: external_exports.string().nullish(),
-      choices: external_exports.array(
-        external_exports.object({
-          text: external_exports.string(),
-          finish_reason: external_exports.string(),
-          logprobs: external_exports.object({
-            tokens: external_exports.array(external_exports.string()),
-            token_logprobs: external_exports.array(external_exports.number()),
-            top_logprobs: external_exports.array(external_exports.record(external_exports.string(), external_exports.number())).nullish()
-          }).nullish()
-        })
-      ),
-      usage: external_exports.object({
-        prompt_tokens: external_exports.number(),
-        completion_tokens: external_exports.number(),
-        total_tokens: external_exports.number()
-      }).nullish()
-    })
-  )
-);
-var openaiCompletionChunkSchema = lazySchema(
-  () => zodSchema(
-    external_exports.union([
-      external_exports.object({
-        id: external_exports.string().nullish(),
-        created: external_exports.number().nullish(),
-        model: external_exports.string().nullish(),
-        choices: external_exports.array(
-          external_exports.object({
-            text: external_exports.string(),
-            finish_reason: external_exports.string().nullish(),
-            index: external_exports.number().nullish(),
-            logprobs: external_exports.object({
-              tokens: external_exports.array(external_exports.string()),
-              token_logprobs: external_exports.array(external_exports.number()),
-              top_logprobs: external_exports.array(external_exports.record(external_exports.string(), external_exports.number())).nullish()
-            }).nullish()
-          })
-        ),
-        usage: external_exports.object({
-          prompt_tokens: external_exports.number(),
-          completion_tokens: external_exports.number(),
-          total_tokens: external_exports.number()
-        }).nullish()
-      }),
-      openaiErrorDataSchema
-    ])
-  )
-);
-var openaiLanguageModelCompletionOptions = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      /**
-       * Echo back the prompt in addition to the completion.
-       */
-      echo: external_exports.boolean().optional(),
-      /**
-       * Modify the likelihood of specified tokens appearing in the completion.
-       *
-       * Accepts a JSON object that maps tokens (specified by their token ID in
-       * the GPT tokenizer) to an associated bias value from -100 to 100. You
-       * can use this tokenizer tool to convert text to token IDs. Mathematically,
-       * the bias is added to the logits generated by the model prior to sampling.
-       * The exact effect will vary per model, but values between -1 and 1 should
-       * decrease or increase likelihood of selection; values like -100 or 100
-       * should result in a ban or exclusive selection of the relevant token.
-       *
-       * As an example, you can pass {"50256": -100} to prevent the <|endoftext|>
-       * token from being generated.
-       */
-      logitBias: external_exports.record(external_exports.string(), external_exports.number()).optional(),
-      /**
-       * The suffix that comes after a completion of inserted text.
-       */
-      suffix: external_exports.string().optional(),
-      /**
-       * A unique identifier representing your end-user, which can help OpenAI to
-       * monitor and detect abuse. Learn more.
-       */
-      user: external_exports.string().optional(),
-      /**
-       * Return the log probabilities of the tokens. Including logprobs will increase
-       * the response size and can slow down response times. However, it can
-       * be useful to better understand how the model is behaving.
-       * Setting to true will return the log probabilities of the tokens that
-       * were generated.
-       * Setting to a number will return the log probabilities of the top n
-       * tokens that were generated.
-       */
-      logprobs: external_exports.union([external_exports.boolean(), external_exports.number()]).optional()
-    })
-  )
-);
-var OpenAICompletionLanguageModel = class {
+__name(mapOpenAICompatibleFinishReason2, "mapOpenAICompatibleFinishReason2");
+var openaiCompatibleLanguageModelCompletionOptions = external_exports.object({
+  /**
+   * Echo back the prompt in addition to the completion.
+   */
+  echo: external_exports.boolean().optional(),
+  /**
+   * Modify the likelihood of specified tokens appearing in the completion.
+   *
+   * Accepts a JSON object that maps tokens (specified by their token ID in
+   * the GPT tokenizer) to an associated bias value from -100 to 100.
+   */
+  logitBias: external_exports.record(external_exports.string(), external_exports.number()).optional(),
+  /**
+   * The suffix that comes after a completion of inserted text.
+   */
+  suffix: external_exports.string().optional(),
+  /**
+   * A unique identifier representing your end-user, which can help providers to
+   * monitor and detect abuse.
+   */
+  user: external_exports.string().optional()
+});
+var OpenAICompatibleCompletionLanguageModel = class {
   static {
-    __name(this, "OpenAICompletionLanguageModel");
+    __name(this, "OpenAICompatibleCompletionLanguageModel");
   }
+  // type inferred via constructor
   constructor(modelId, config2) {
     this.specificationVersion = "v3";
-    this.supportedUrls = {
-      // No URLs are supported for completion models.
-    };
+    var _a21;
     this.modelId = modelId;
     this.config = config2;
+    const errorStructure = (_a21 = config2.errorStructure) != null ? _a21 : defaultOpenAICompatibleErrorStructure;
+    this.chunkSchema = createOpenAICompatibleCompletionChunkSchema(
+      errorStructure.errorSchema
+    );
+    this.failedResponseHandler = createJsonErrorResponseHandler(errorStructure);
+  }
+  get provider() {
+    return this.config.provider;
   }
   get providerOptionsName() {
     return this.config.provider.split(".")[0].trim();
   }
-  get provider() {
-    return this.config.provider;
+  get supportedUrls() {
+    var _a21, _b17, _c;
+    return (_c = (_b17 = (_a21 = this.config).supportedUrls) == null ? void 0 : _b17.call(_a21)) != null ? _c : {};
   }
   async getArgs({
     prompt,
@@ -33882,24 +36775,18 @@ var OpenAICompletionLanguageModel = class {
     presencePenalty,
     stopSequences: userStopSequences,
     responseFormat,
-    tools,
-    toolChoice,
     seed,
-    providerOptions
+    providerOptions,
+    tools,
+    toolChoice
   }) {
+    var _a21;
     const warnings = [];
-    const openaiOptions = {
-      ...await parseProviderOptions({
-        provider: "openai",
-        providerOptions,
-        schema: openaiLanguageModelCompletionOptions
-      }),
-      ...await parseProviderOptions({
-        provider: this.providerOptionsName,
-        providerOptions,
-        schema: openaiLanguageModelCompletionOptions
-      })
-    };
+    const completionOptions = (_a21 = await parseProviderOptions({
+      provider: this.providerOptionsName,
+      providerOptions,
+      schema: openaiCompatibleLanguageModelCompletionOptions
+    })) != null ? _a21 : {};
     if (topK != null) {
       warnings.push({ type: "unsupported", feature: "topK" });
     }
@@ -33916,18 +36803,17 @@ var OpenAICompletionLanguageModel = class {
         details: "JSON response format is not supported."
       });
     }
-    const { prompt: completionPrompt, stopSequences } = convertToOpenAICompletionPrompt({ prompt });
+    const { prompt: completionPrompt, stopSequences } = convertToOpenAICompatibleCompletionPrompt({ prompt });
     const stop = [...stopSequences != null ? stopSequences : [], ...userStopSequences != null ? userStopSequences : []];
     return {
       args: {
         // model id:
         model: this.modelId,
         // model specific settings:
-        echo: openaiOptions.echo,
-        logit_bias: openaiOptions.logitBias,
-        logprobs: (openaiOptions == null ? void 0 : openaiOptions.logprobs) === true ? 0 : (openaiOptions == null ? void 0 : openaiOptions.logprobs) === false ? void 0 : openaiOptions == null ? void 0 : openaiOptions.logprobs,
-        suffix: openaiOptions.suffix,
-        user: openaiOptions.user,
+        echo: completionOptions.echo,
+        logit_bias: completionOptions.logitBias,
+        suffix: completionOptions.suffix,
+        user: completionOptions.user,
         // standardized settings:
         max_tokens: maxOutputTokens,
         temperature,
@@ -33935,6 +36821,7 @@ var OpenAICompletionLanguageModel = class {
         frequency_penalty: frequencyPenalty,
         presence_penalty: presencePenalty,
         seed,
+        ...providerOptions == null ? void 0 : providerOptions[this.providerOptionsName],
         // prompt:
         prompt: completionPrompt,
         // stop sequences:
@@ -33944,7 +36831,6 @@ var OpenAICompletionLanguageModel = class {
     };
   }
   async doGenerate(options) {
-    var _a21;
     const { args, warnings } = await this.getArgs(options);
     const {
       responseHeaders,
@@ -33957,24 +36843,24 @@ var OpenAICompletionLanguageModel = class {
       }),
       headers: combineHeaders(this.config.headers(), options.headers),
       body: args,
-      failedResponseHandler: openaiFailedResponseHandler,
+      failedResponseHandler: this.failedResponseHandler,
       successfulResponseHandler: createJsonResponseHandler(
-        openaiCompletionResponseSchema
+        openaiCompatibleCompletionResponseSchema
       ),
       abortSignal: options.abortSignal,
       fetch: this.config.fetch
     });
     const choice2 = response.choices[0];
-    const providerMetadata = { openai: {} };
-    if (choice2.logprobs != null) {
-      providerMetadata.openai.logprobs = choice2.logprobs;
+    const content = [];
+    if (choice2.text != null && choice2.text.length > 0) {
+      content.push({ type: "text", text: choice2.text });
     }
     return {
-      content: [{ type: "text", text: choice2.text }],
-      usage: convertOpenAICompletionUsage(response.usage),
+      content,
+      usage: convertOpenAICompatibleCompletionUsage(response.usage),
       finishReason: {
-        unified: mapOpenAIFinishReason2(choice2.finish_reason),
-        raw: (_a21 = choice2.finish_reason) != null ? _a21 : void 0
+        unified: mapOpenAICompatibleFinishReason2(choice2.finish_reason),
+        raw: choice2.finish_reason
       },
       request: { body: args },
       response: {
@@ -33982,7 +36868,6 @@ var OpenAICompletionLanguageModel = class {
         headers: responseHeaders,
         body: rawResponse
       },
-      providerMetadata,
       warnings
     };
   }
@@ -33991,9 +36876,8 @@ var OpenAICompletionLanguageModel = class {
     const body = {
       ...args,
       stream: true,
-      stream_options: {
-        include_usage: true
-      }
+      // only include stream_options when in strict compatibility mode:
+      stream_options: this.config.includeUsage ? { include_usage: true } : void 0
     };
     const { responseHeaders, value: response } = await postJsonToApi({
       url: this.config.url({
@@ -34002,9 +36886,9 @@ var OpenAICompletionLanguageModel = class {
       }),
       headers: combineHeaders(this.config.headers(), options.headers),
       body,
-      failedResponseHandler: openaiFailedResponseHandler,
+      failedResponseHandler: this.failedResponseHandler,
       successfulResponseHandler: createEventSourceResponseHandler(
-        openaiCompletionChunkSchema
+        this.chunkSchema
       ),
       abortSignal: options.abortSignal,
       fetch: this.config.fetch
@@ -34013,7 +36897,6 @@ var OpenAICompletionLanguageModel = class {
       unified: "other",
       raw: void 0
     };
-    const providerMetadata = { openai: {} };
     let usage = void 0;
     let isFirstChunk = true;
     return {
@@ -34023,6 +36906,7 @@ var OpenAICompletionLanguageModel = class {
             controller.enqueue({ type: "stream-start", warnings });
           },
           transform(chunk, controller) {
+            var _a21;
             if (options.includeRawChunks) {
               controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
             }
@@ -34043,7 +36927,10 @@ var OpenAICompletionLanguageModel = class {
                 type: "response-metadata",
                 ...getResponseMetadata2(value)
               });
-              controller.enqueue({ type: "text-start", id: "0" });
+              controller.enqueue({
+                type: "text-start",
+                id: "0"
+              });
             }
             if (value.usage != null) {
               usage = value.usage;
@@ -34051,14 +36938,11 @@ var OpenAICompletionLanguageModel = class {
             const choice2 = value.choices[0];
             if ((choice2 == null ? void 0 : choice2.finish_reason) != null) {
               finishReason = {
-                unified: mapOpenAIFinishReason2(choice2.finish_reason),
-                raw: choice2.finish_reason
+                unified: mapOpenAICompatibleFinishReason2(choice2.finish_reason),
+                raw: (_a21 = choice2.finish_reason) != null ? _a21 : void 0
               };
             }
-            if ((choice2 == null ? void 0 : choice2.logprobs) != null) {
-              providerMetadata.openai.logprobs = choice2.logprobs;
-            }
-            if ((choice2 == null ? void 0 : choice2.text) != null && choice2.text.length > 0) {
+            if ((choice2 == null ? void 0 : choice2.text) != null) {
               controller.enqueue({
                 type: "text-delta",
                 id: "0",
@@ -34073,8 +36957,7 @@ var OpenAICompletionLanguageModel = class {
             controller.enqueue({
               type: "finish",
               finishReason,
-              providerMetadata,
-              usage: convertOpenAICompletionUsage(usage)
+              usage: convertOpenAICompatibleCompletionUsage(usage)
             });
           }
         })
@@ -34084,43 +36967,73 @@ var OpenAICompletionLanguageModel = class {
     };
   }
 };
-var openaiEmbeddingModelOptions = lazySchema(
-  () => zodSchema(
+var usageSchema = external_exports.object({
+  prompt_tokens: external_exports.number(),
+  completion_tokens: external_exports.number(),
+  total_tokens: external_exports.number()
+});
+var openaiCompatibleCompletionResponseSchema = external_exports.object({
+  id: external_exports.string().nullish(),
+  created: external_exports.number().nullish(),
+  model: external_exports.string().nullish(),
+  choices: external_exports.array(
     external_exports.object({
-      /**
-       * The number of dimensions the resulting output embeddings should have.
-       * Only supported in text-embedding-3 and later models.
-       */
-      dimensions: external_exports.number().optional(),
-      /**
-       * A unique identifier representing your end-user, which can help OpenAI to
-       * monitor and detect abuse. Learn more.
-       */
-      user: external_exports.string().optional()
+      text: external_exports.string(),
+      finish_reason: external_exports.string()
     })
-  )
-);
-var openaiTextEmbeddingResponseSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      data: external_exports.array(external_exports.object({ embedding: external_exports.array(external_exports.number()) })),
-      usage: external_exports.object({ prompt_tokens: external_exports.number() }).nullish()
-    })
-  )
-);
-var OpenAIEmbeddingModel = class {
+  ),
+  usage: usageSchema.nullish()
+});
+var createOpenAICompatibleCompletionChunkSchema = /* @__PURE__ */ __name((errorSchema) => external_exports.union([
+  external_exports.object({
+    id: external_exports.string().nullish(),
+    created: external_exports.number().nullish(),
+    model: external_exports.string().nullish(),
+    choices: external_exports.array(
+      external_exports.object({
+        text: external_exports.string(),
+        finish_reason: external_exports.string().nullish(),
+        index: external_exports.number()
+      })
+    ),
+    usage: usageSchema.nullish()
+  }),
+  errorSchema
+]), "createOpenAICompatibleCompletionChunkSchema");
+var openaiCompatibleEmbeddingModelOptions = external_exports.object({
+  /**
+   * The number of dimensions the resulting output embeddings should have.
+   * Only supported in text-embedding-3 and later models.
+   */
+  dimensions: external_exports.number().optional(),
+  /**
+   * A unique identifier representing your end-user, which can help providers to
+   * monitor and detect abuse.
+   */
+  user: external_exports.string().optional()
+});
+var OpenAICompatibleEmbeddingModel = class {
   static {
-    __name(this, "OpenAIEmbeddingModel");
+    __name(this, "OpenAICompatibleEmbeddingModel");
   }
   constructor(modelId, config2) {
     this.specificationVersion = "v3";
-    this.maxEmbeddingsPerCall = 2048;
-    this.supportsParallelCalls = true;
     this.modelId = modelId;
     this.config = config2;
   }
   get provider() {
     return this.config.provider;
+  }
+  get maxEmbeddingsPerCall() {
+    var _a21;
+    return (_a21 = this.config.maxEmbeddingsPerCall) != null ? _a21 : 2048;
+  }
+  get supportsParallelCalls() {
+    var _a21;
+    return (_a21 = this.config.supportsParallelCalls) != null ? _a21 : true;
+  }
+  get providerOptionsName() {
+    return this.config.provider.split(".")[0].trim();
   }
   async doEmbed({
     values,
@@ -34128,7 +37041,32 @@ var OpenAIEmbeddingModel = class {
     abortSignal,
     providerOptions
   }) {
-    var _a21;
+    var _a21, _b17, _c;
+    const warnings = [];
+    const deprecatedOptions = await parseProviderOptions({
+      provider: "openai-compatible",
+      providerOptions,
+      schema: openaiCompatibleEmbeddingModelOptions
+    });
+    if (deprecatedOptions != null) {
+      warnings.push({
+        type: "other",
+        message: `The 'openai-compatible' key in providerOptions is deprecated. Use 'openaiCompatible' instead.`
+      });
+    }
+    const compatibleOptions = Object.assign(
+      deprecatedOptions != null ? deprecatedOptions : {},
+      (_a21 = await parseProviderOptions({
+        provider: "openaiCompatible",
+        providerOptions,
+        schema: openaiCompatibleEmbeddingModelOptions
+      })) != null ? _a21 : {},
+      (_b17 = await parseProviderOptions({
+        provider: this.providerOptionsName,
+        providerOptions,
+        schema: openaiCompatibleEmbeddingModelOptions
+      })) != null ? _b17 : {}
+    );
     if (values.length > this.maxEmbeddingsPerCall) {
       throw new TooManyEmbeddingValuesForCallError({
         provider: this.provider,
@@ -34137,11 +37075,6 @@ var OpenAIEmbeddingModel = class {
         values
       });
     }
-    const openaiOptions = (_a21 = await parseProviderOptions({
-      provider: "openai",
-      providerOptions,
-      schema: openaiEmbeddingModelOptions
-    })) != null ? _a21 : {};
     const {
       responseHeaders,
       value: response,
@@ -34156,10 +37089,12 @@ var OpenAIEmbeddingModel = class {
         model: this.modelId,
         input: values,
         encoding_format: "float",
-        dimensions: openaiOptions.dimensions,
-        user: openaiOptions.user
+        dimensions: compatibleOptions.dimensions,
+        user: compatibleOptions.user
       },
-      failedResponseHandler: openaiFailedResponseHandler,
+      failedResponseHandler: createJsonErrorResponseHandler(
+        (_c = this.config.errorStructure) != null ? _c : defaultOpenAICompatibleErrorStructure
+      ),
       successfulResponseHandler: createJsonResponseHandler(
         openaiTextEmbeddingResponseSchema
       ),
@@ -34167,88 +37102,58 @@ var OpenAIEmbeddingModel = class {
       fetch: this.config.fetch
     });
     return {
-      warnings: [],
+      warnings,
       embeddings: response.data.map((item) => item.embedding),
       usage: response.usage ? { tokens: response.usage.prompt_tokens } : void 0,
+      providerMetadata: response.providerMetadata,
       response: { headers: responseHeaders, body: rawValue }
     };
   }
 };
-var openaiImageResponseSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      created: external_exports.number().nullish(),
-      data: external_exports.array(
-        external_exports.object({
-          b64_json: external_exports.string(),
-          revised_prompt: external_exports.string().nullish()
-        })
-      ),
-      background: external_exports.string().nullish(),
-      output_format: external_exports.string().nullish(),
-      size: external_exports.string().nullish(),
-      quality: external_exports.string().nullish(),
-      usage: external_exports.object({
-        input_tokens: external_exports.number().nullish(),
-        output_tokens: external_exports.number().nullish(),
-        total_tokens: external_exports.number().nullish(),
-        input_tokens_details: external_exports.object({
-          image_tokens: external_exports.number().nullish(),
-          text_tokens: external_exports.number().nullish()
-        }).nullish()
-      }).nullish()
-    })
-  )
-);
-var modelMaxImagesPerCall = {
-  "dall-e-3": 1,
-  "dall-e-2": 10,
-  "gpt-image-1": 10,
-  "gpt-image-1-mini": 10,
-  "gpt-image-1.5": 10,
-  "chatgpt-image-latest": 10
-};
-var defaultResponseFormatPrefixes = [
-  "chatgpt-image-",
-  "gpt-image-1-mini",
-  "gpt-image-1.5",
-  "gpt-image-1"
-];
-function hasDefaultResponseFormat(modelId) {
-  return defaultResponseFormatPrefixes.some(
-    (prefix) => modelId.startsWith(prefix)
-  );
-}
-__name(hasDefaultResponseFormat, "hasDefaultResponseFormat");
-var OpenAIImageModel = class {
+var openaiTextEmbeddingResponseSchema = external_exports.object({
+  data: external_exports.array(external_exports.object({ embedding: external_exports.array(external_exports.number()) })),
+  usage: external_exports.object({ prompt_tokens: external_exports.number() }).nullish(),
+  providerMetadata: external_exports.record(external_exports.string(), external_exports.record(external_exports.string(), external_exports.any())).optional()
+});
+var OpenAICompatibleImageModel = class {
   static {
-    __name(this, "OpenAIImageModel");
+    __name(this, "OpenAICompatibleImageModel");
   }
   constructor(modelId, config2) {
     this.modelId = modelId;
     this.config = config2;
     this.specificationVersion = "v3";
-  }
-  get maxImagesPerCall() {
-    var _a21;
-    return (_a21 = modelMaxImagesPerCall[this.modelId]) != null ? _a21 : 1;
+    this.maxImagesPerCall = 10;
   }
   get provider() {
     return this.config.provider;
   }
+  /**
+   * The provider options key used to extract provider-specific options.
+   */
+  get providerOptionsKey() {
+    return this.config.provider.split(".")[0].trim();
+  }
+  // TODO: deprecate non-camelCase keys and remove in future major version
+  getArgs(providerOptions) {
+    return {
+      ...providerOptions[this.providerOptionsKey],
+      ...providerOptions[toCamelCase(this.providerOptionsKey)]
+    };
+  }
   async doGenerate({
     prompt,
-    files,
-    mask,
     n: n2,
     size,
     aspectRatio,
     seed,
     providerOptions,
     headers,
-    abortSignal
+    abortSignal,
+    files,
+    mask
   }) {
-    var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i, _j, _k;
+    var _a21, _b17, _c, _d, _e2;
     const warnings = [];
     if (aspectRatio != null) {
       warnings.push({
@@ -34261,7 +37166,8 @@ var OpenAIImageModel = class {
       warnings.push({ type: "unsupported", feature: "seed" });
     }
     const currentDate = (_c = (_b17 = (_a21 = this.config._internal) == null ? void 0 : _a21.currentDate) == null ? void 0 : _b17.call(_a21)) != null ? _c : /* @__PURE__ */ new Date();
-    if (files != null) {
+    const args = this.getArgs(providerOptions);
+    if (files != null && files.length > 0) {
       const { value: response2, responseHeaders: responseHeaders2 } = await postFormDataToApi({
         url: this.config.url({
           path: "/images/edits",
@@ -34271,28 +37177,17 @@ var OpenAIImageModel = class {
         formData: convertToFormData({
           model: this.modelId,
           prompt,
-          image: await Promise.all(
-            files.map(
-              (file2) => file2.type === "file" ? new Blob(
-                [
-                  file2.data instanceof Uint8Array ? new Blob([file2.data], {
-                    type: file2.mediaType
-                  }) : new Blob([convertBase64ToUint8Array(file2.data)], {
-                    type: file2.mediaType
-                  })
-                ],
-                { type: file2.mediaType }
-              ) : downloadBlob(file2.url)
-            )
-          ),
+          image: await Promise.all(files.map((file2) => fileToBlob(file2))),
           mask: mask != null ? await fileToBlob(mask) : void 0,
           n: n2,
           size,
-          ...(_d = providerOptions.openai) != null ? _d : {}
+          ...args
         }),
-        failedResponseHandler: openaiFailedResponseHandler,
+        failedResponseHandler: createJsonErrorResponseHandler(
+          (_d = this.config.errorStructure) != null ? _d : defaultOpenAICompatibleErrorStructure
+        ),
         successfulResponseHandler: createJsonResponseHandler(
-          openaiImageResponseSchema
+          openaiCompatibleImageResponseSchema
         ),
         abortSignal,
         fetch: this.config.fetch
@@ -34300,35 +37195,10 @@ var OpenAIImageModel = class {
       return {
         images: response2.data.map((item) => item.b64_json),
         warnings,
-        usage: response2.usage != null ? {
-          inputTokens: (_e2 = response2.usage.input_tokens) != null ? _e2 : void 0,
-          outputTokens: (_f = response2.usage.output_tokens) != null ? _f : void 0,
-          totalTokens: (_g = response2.usage.total_tokens) != null ? _g : void 0
-        } : void 0,
         response: {
           timestamp: currentDate,
           modelId: this.modelId,
           headers: responseHeaders2
-        },
-        providerMetadata: {
-          openai: {
-            images: response2.data.map((item, index) => {
-              var _a24, _b23, _c2, _d2, _e22, _f2;
-              return {
-                ...item.revised_prompt ? { revisedPrompt: item.revised_prompt } : {},
-                created: (_a24 = response2.created) != null ? _a24 : void 0,
-                size: (_b23 = response2.size) != null ? _b23 : void 0,
-                quality: (_c2 = response2.quality) != null ? _c2 : void 0,
-                background: (_d2 = response2.background) != null ? _d2 : void 0,
-                outputFormat: (_e22 = response2.output_format) != null ? _e22 : void 0,
-                ...distributeTokenDetails(
-                  (_f2 = response2.usage) == null ? void 0 : _f2.input_tokens_details,
-                  index,
-                  response2.data.length
-                )
-              };
-            })
-          }
         }
       };
     }
@@ -34343,12 +37213,14 @@ var OpenAIImageModel = class {
         prompt,
         n: n2,
         size,
-        ...(_h = providerOptions.openai) != null ? _h : {},
-        ...!hasDefaultResponseFormat(this.modelId) ? { response_format: "b64_json" } : {}
+        ...args,
+        response_format: "b64_json"
       },
-      failedResponseHandler: openaiFailedResponseHandler,
+      failedResponseHandler: createJsonErrorResponseHandler(
+        (_e2 = this.config.errorStructure) != null ? _e2 : defaultOpenAICompatibleErrorStructure
+      ),
       successfulResponseHandler: createJsonResponseHandler(
-        openaiImageResponseSchema
+        openaiCompatibleImageResponseSchema
       ),
       abortSignal,
       fetch: this.config.fetch
@@ -34356,59 +37228,18 @@ var OpenAIImageModel = class {
     return {
       images: response.data.map((item) => item.b64_json),
       warnings,
-      usage: response.usage != null ? {
-        inputTokens: (_i = response.usage.input_tokens) != null ? _i : void 0,
-        outputTokens: (_j = response.usage.output_tokens) != null ? _j : void 0,
-        totalTokens: (_k = response.usage.total_tokens) != null ? _k : void 0
-      } : void 0,
       response: {
         timestamp: currentDate,
         modelId: this.modelId,
         headers: responseHeaders
-      },
-      providerMetadata: {
-        openai: {
-          images: response.data.map((item, index) => {
-            var _a24, _b23, _c2, _d2, _e22, _f2;
-            return {
-              ...item.revised_prompt ? { revisedPrompt: item.revised_prompt } : {},
-              created: (_a24 = response.created) != null ? _a24 : void 0,
-              size: (_b23 = response.size) != null ? _b23 : void 0,
-              quality: (_c2 = response.quality) != null ? _c2 : void 0,
-              background: (_d2 = response.background) != null ? _d2 : void 0,
-              outputFormat: (_e22 = response.output_format) != null ? _e22 : void 0,
-              ...distributeTokenDetails(
-                (_f2 = response.usage) == null ? void 0 : _f2.input_tokens_details,
-                index,
-                response.data.length
-              )
-            };
-          })
-        }
       }
     };
   }
 };
-function distributeTokenDetails(details, index, total) {
-  if (details == null) {
-    return {};
-  }
-  const result = {};
-  if (details.image_tokens != null) {
-    const base = Math.floor(details.image_tokens / total);
-    const remainder = details.image_tokens - base * (total - 1);
-    result.imageTokens = index === total - 1 ? remainder : base;
-  }
-  if (details.text_tokens != null) {
-    const base = Math.floor(details.text_tokens / total);
-    const remainder = details.text_tokens - base * (total - 1);
-    result.textTokens = index === total - 1 ? remainder : base;
-  }
-  return result;
-}
-__name(distributeTokenDetails, "distributeTokenDetails");
+var openaiCompatibleImageResponseSchema = external_exports.object({
+  data: external_exports.array(external_exports.object({ b64_json: external_exports.string() }))
+});
 async function fileToBlob(file2) {
-  if (!file2) return void 0;
   if (file2.type === "url") {
     return downloadBlob(file2.url);
   }
@@ -34416,4390 +37247,58 @@ async function fileToBlob(file2) {
   return new Blob([data], { type: file2.mediaType });
 }
 __name(fileToBlob, "fileToBlob");
-var applyPatchInputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      callId: external_exports.string(),
-      operation: external_exports.discriminatedUnion("type", [
-        external_exports.object({
-          type: external_exports.literal("create_file"),
-          path: external_exports.string(),
-          diff: external_exports.string()
-        }),
-        external_exports.object({
-          type: external_exports.literal("delete_file"),
-          path: external_exports.string()
-        }),
-        external_exports.object({
-          type: external_exports.literal("update_file"),
-          path: external_exports.string(),
-          diff: external_exports.string()
-        })
-      ])
-    })
-  )
-);
-var applyPatchOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      status: external_exports.enum(["completed", "failed"]),
-      output: external_exports.string().optional()
-    })
-  )
-);
-var applyPatchArgsSchema = lazySchema(() => zodSchema(external_exports.object({})));
-var applyPatchToolFactory = createProviderToolFactoryWithOutputSchema({
-  id: "openai.apply_patch",
-  inputSchema: applyPatchInputSchema,
-  outputSchema: applyPatchOutputSchema
-});
-var applyPatch = applyPatchToolFactory;
-var codeInterpreterInputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      code: external_exports.string().nullish(),
-      containerId: external_exports.string()
-    })
-  )
-);
-var codeInterpreterOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      outputs: external_exports.array(
-        external_exports.discriminatedUnion("type", [
-          external_exports.object({ type: external_exports.literal("logs"), logs: external_exports.string() }),
-          external_exports.object({ type: external_exports.literal("image"), url: external_exports.string() })
-        ])
-      ).nullish()
-    })
-  )
-);
-var codeInterpreterArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      container: external_exports.union([
-        external_exports.string(),
-        external_exports.object({
-          fileIds: external_exports.array(external_exports.string()).optional()
-        })
-      ]).optional()
-    })
-  )
-);
-var codeInterpreterToolFactory = createProviderToolFactoryWithOutputSchema({
-  id: "openai.code_interpreter",
-  inputSchema: codeInterpreterInputSchema,
-  outputSchema: codeInterpreterOutputSchema
-});
-var codeInterpreter = /* @__PURE__ */ __name((args = {}) => {
-  return codeInterpreterToolFactory(args);
-}, "codeInterpreter");
-var customArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      name: external_exports.string(),
-      description: external_exports.string().optional(),
-      format: external_exports.union([
-        external_exports.object({
-          type: external_exports.literal("grammar"),
-          syntax: external_exports.enum(["regex", "lark"]),
-          definition: external_exports.string()
-        }),
-        external_exports.object({
-          type: external_exports.literal("text")
-        })
-      ]).optional()
-    })
-  )
-);
-var customInputSchema = lazySchema(() => zodSchema(external_exports.string()));
-var customToolFactory = createProviderToolFactory({
-  id: "openai.custom",
-  inputSchema: customInputSchema
-});
-var customTool = /* @__PURE__ */ __name((args) => customToolFactory(args), "customTool");
-var comparisonFilterSchema = external_exports.object({
-  key: external_exports.string(),
-  type: external_exports.enum(["eq", "ne", "gt", "gte", "lt", "lte", "in", "nin"]),
-  value: external_exports.union([external_exports.string(), external_exports.number(), external_exports.boolean(), external_exports.array(external_exports.string())])
-});
-var compoundFilterSchema = external_exports.object({
-  type: external_exports.enum(["and", "or"]),
-  filters: external_exports.array(
-    external_exports.union([comparisonFilterSchema, external_exports.lazy(() => compoundFilterSchema)])
-  )
-});
-var fileSearchArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      vectorStoreIds: external_exports.array(external_exports.string()),
-      maxNumResults: external_exports.number().optional(),
-      ranking: external_exports.object({
-        ranker: external_exports.string().optional(),
-        scoreThreshold: external_exports.number().optional()
-      }).optional(),
-      filters: external_exports.union([comparisonFilterSchema, compoundFilterSchema]).optional()
-    })
-  )
-);
-var fileSearchOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      queries: external_exports.array(external_exports.string()),
-      results: external_exports.array(
-        external_exports.object({
-          attributes: external_exports.record(external_exports.string(), external_exports.unknown()),
-          fileId: external_exports.string(),
-          filename: external_exports.string(),
-          score: external_exports.number(),
-          text: external_exports.string()
-        })
-      ).nullable()
-    })
-  )
-);
-var fileSearch = createProviderToolFactoryWithOutputSchema({
-  id: "openai.file_search",
-  inputSchema: external_exports.object({}),
-  outputSchema: fileSearchOutputSchema
-});
-var imageGenerationArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      background: external_exports.enum(["auto", "opaque", "transparent"]).optional(),
-      inputFidelity: external_exports.enum(["low", "high"]).optional(),
-      inputImageMask: external_exports.object({
-        fileId: external_exports.string().optional(),
-        imageUrl: external_exports.string().optional()
-      }).optional(),
-      model: external_exports.string().optional(),
-      moderation: external_exports.enum(["auto"]).optional(),
-      outputCompression: external_exports.number().int().min(0).max(100).optional(),
-      outputFormat: external_exports.enum(["png", "jpeg", "webp"]).optional(),
-      partialImages: external_exports.number().int().min(0).max(3).optional(),
-      quality: external_exports.enum(["auto", "low", "medium", "high"]).optional(),
-      size: external_exports.enum(["1024x1024", "1024x1536", "1536x1024", "auto"]).optional()
-    }).strict()
-  )
-);
-var imageGenerationInputSchema = lazySchema(() => zodSchema(external_exports.object({})));
-var imageGenerationOutputSchema = lazySchema(
-  () => zodSchema(external_exports.object({ result: external_exports.string() }))
-);
-var imageGenerationToolFactory = createProviderToolFactoryWithOutputSchema({
-  id: "openai.image_generation",
-  inputSchema: imageGenerationInputSchema,
-  outputSchema: imageGenerationOutputSchema
-});
-var imageGeneration = /* @__PURE__ */ __name((args = {}) => {
-  return imageGenerationToolFactory(args);
-}, "imageGeneration");
-var localShellInputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      action: external_exports.object({
-        type: external_exports.literal("exec"),
-        command: external_exports.array(external_exports.string()),
-        timeoutMs: external_exports.number().optional(),
-        user: external_exports.string().optional(),
-        workingDirectory: external_exports.string().optional(),
-        env: external_exports.record(external_exports.string(), external_exports.string()).optional()
-      })
-    })
-  )
-);
-var localShellOutputSchema = lazySchema(
-  () => zodSchema(external_exports.object({ output: external_exports.string() }))
-);
-var localShell = createProviderToolFactoryWithOutputSchema({
-  id: "openai.local_shell",
-  inputSchema: localShellInputSchema,
-  outputSchema: localShellOutputSchema
-});
-var shellInputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      action: external_exports.object({
-        commands: external_exports.array(external_exports.string()),
-        timeoutMs: external_exports.number().optional(),
-        maxOutputLength: external_exports.number().optional()
-      })
-    })
-  )
-);
-var shellOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      output: external_exports.array(
-        external_exports.object({
-          stdout: external_exports.string(),
-          stderr: external_exports.string(),
-          outcome: external_exports.discriminatedUnion("type", [
-            external_exports.object({ type: external_exports.literal("timeout") }),
-            external_exports.object({ type: external_exports.literal("exit"), exitCode: external_exports.number() })
-          ])
-        })
-      )
-    })
-  )
-);
-var shellSkillsSchema = external_exports.array(
-  external_exports.discriminatedUnion("type", [
-    external_exports.object({
-      type: external_exports.literal("skillReference"),
-      skillId: external_exports.string(),
-      version: external_exports.string().optional()
-    }),
-    external_exports.object({
-      type: external_exports.literal("inline"),
-      name: external_exports.string(),
-      description: external_exports.string(),
-      source: external_exports.object({
-        type: external_exports.literal("base64"),
-        mediaType: external_exports.literal("application/zip"),
-        data: external_exports.string()
-      })
-    })
-  ])
-).optional();
-var shellArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      environment: external_exports.union([
-        external_exports.object({
-          type: external_exports.literal("containerAuto"),
-          fileIds: external_exports.array(external_exports.string()).optional(),
-          memoryLimit: external_exports.enum(["1g", "4g", "16g", "64g"]).optional(),
-          networkPolicy: external_exports.discriminatedUnion("type", [
-            external_exports.object({ type: external_exports.literal("disabled") }),
-            external_exports.object({
-              type: external_exports.literal("allowlist"),
-              allowedDomains: external_exports.array(external_exports.string()),
-              domainSecrets: external_exports.array(
-                external_exports.object({
-                  domain: external_exports.string(),
-                  name: external_exports.string(),
-                  value: external_exports.string()
-                })
-              ).optional()
-            })
-          ]).optional(),
-          skills: shellSkillsSchema
-        }),
-        external_exports.object({
-          type: external_exports.literal("containerReference"),
-          containerId: external_exports.string()
-        }),
-        external_exports.object({
-          type: external_exports.literal("local").optional(),
-          skills: external_exports.array(
-            external_exports.object({
-              name: external_exports.string(),
-              description: external_exports.string(),
-              path: external_exports.string()
-            })
-          ).optional()
-        })
-      ]).optional()
-    })
-  )
-);
-var shell = createProviderToolFactoryWithOutputSchema({
-  id: "openai.shell",
-  inputSchema: shellInputSchema,
-  outputSchema: shellOutputSchema
-});
-var webSearchArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      externalWebAccess: external_exports.boolean().optional(),
-      filters: external_exports.object({ allowedDomains: external_exports.array(external_exports.string()).optional() }).optional(),
-      searchContextSize: external_exports.enum(["low", "medium", "high"]).optional(),
-      userLocation: external_exports.object({
-        type: external_exports.literal("approximate"),
-        country: external_exports.string().optional(),
-        city: external_exports.string().optional(),
-        region: external_exports.string().optional(),
-        timezone: external_exports.string().optional()
-      }).optional()
-    })
-  )
-);
-var webSearchInputSchema = lazySchema(() => zodSchema(external_exports.object({})));
-var webSearchOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      action: external_exports.discriminatedUnion("type", [
-        external_exports.object({
-          type: external_exports.literal("search"),
-          query: external_exports.string().optional()
-        }),
-        external_exports.object({
-          type: external_exports.literal("openPage"),
-          url: external_exports.string().nullish()
-        }),
-        external_exports.object({
-          type: external_exports.literal("findInPage"),
-          url: external_exports.string().nullish(),
-          pattern: external_exports.string().nullish()
-        })
-      ]).optional(),
-      sources: external_exports.array(
-        external_exports.discriminatedUnion("type", [
-          external_exports.object({ type: external_exports.literal("url"), url: external_exports.string() }),
-          external_exports.object({ type: external_exports.literal("api"), name: external_exports.string() })
-        ])
-      ).optional()
-    })
-  )
-);
-var webSearchToolFactory = createProviderToolFactoryWithOutputSchema({
-  id: "openai.web_search",
-  inputSchema: webSearchInputSchema,
-  outputSchema: webSearchOutputSchema
-});
-var webSearch = /* @__PURE__ */ __name((args = {}) => webSearchToolFactory(args), "webSearch");
-var webSearchPreviewArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      searchContextSize: external_exports.enum(["low", "medium", "high"]).optional(),
-      userLocation: external_exports.object({
-        type: external_exports.literal("approximate"),
-        country: external_exports.string().optional(),
-        city: external_exports.string().optional(),
-        region: external_exports.string().optional(),
-        timezone: external_exports.string().optional()
-      }).optional()
-    })
-  )
-);
-var webSearchPreviewInputSchema = lazySchema(
-  () => zodSchema(external_exports.object({}))
-);
-var webSearchPreviewOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      action: external_exports.discriminatedUnion("type", [
-        external_exports.object({
-          type: external_exports.literal("search"),
-          query: external_exports.string().optional()
-        }),
-        external_exports.object({
-          type: external_exports.literal("openPage"),
-          url: external_exports.string().nullish()
-        }),
-        external_exports.object({
-          type: external_exports.literal("findInPage"),
-          url: external_exports.string().nullish(),
-          pattern: external_exports.string().nullish()
-        })
-      ]).optional()
-    })
-  )
-);
-var webSearchPreview = createProviderToolFactoryWithOutputSchema({
-  id: "openai.web_search_preview",
-  inputSchema: webSearchPreviewInputSchema,
-  outputSchema: webSearchPreviewOutputSchema
-});
-var jsonValueSchema2 = external_exports.lazy(
-  () => external_exports.union([
-    external_exports.string(),
-    external_exports.number(),
-    external_exports.boolean(),
-    external_exports.null(),
-    external_exports.array(jsonValueSchema2),
-    external_exports.record(external_exports.string(), jsonValueSchema2)
-  ])
-);
-var mcpArgsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      serverLabel: external_exports.string(),
-      allowedTools: external_exports.union([
-        external_exports.array(external_exports.string()),
-        external_exports.object({
-          readOnly: external_exports.boolean().optional(),
-          toolNames: external_exports.array(external_exports.string()).optional()
-        })
-      ]).optional(),
-      authorization: external_exports.string().optional(),
-      connectorId: external_exports.string().optional(),
-      headers: external_exports.record(external_exports.string(), external_exports.string()).optional(),
-      requireApproval: external_exports.union([
-        external_exports.enum(["always", "never"]),
-        external_exports.object({
-          never: external_exports.object({
-            toolNames: external_exports.array(external_exports.string()).optional()
-          }).optional()
-        })
-      ]).optional(),
-      serverDescription: external_exports.string().optional(),
-      serverUrl: external_exports.string().optional()
-    }).refine(
-      (v2) => v2.serverUrl != null || v2.connectorId != null,
-      "One of serverUrl or connectorId must be provided."
-    )
-  )
-);
-var mcpInputSchema = lazySchema(() => zodSchema(external_exports.object({})));
-var mcpOutputSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      type: external_exports.literal("call"),
-      serverLabel: external_exports.string(),
-      name: external_exports.string(),
-      arguments: external_exports.string(),
-      output: external_exports.string().nullish(),
-      error: external_exports.union([external_exports.string(), jsonValueSchema2]).optional()
-    })
-  )
-);
-var mcpToolFactory = createProviderToolFactoryWithOutputSchema({
-  id: "openai.mcp",
-  inputSchema: mcpInputSchema,
-  outputSchema: mcpOutputSchema
-});
-var mcp = /* @__PURE__ */ __name((args) => mcpToolFactory(args), "mcp");
-var openaiTools = {
-  /**
-   * The apply_patch tool lets GPT-5.1 create, update, and delete files in your
-   * codebase using structured diffs. Instead of just suggesting edits, the model
-   * emits patch operations that your application applies and then reports back on,
-   * enabling iterative, multi-step code editing workflows.
-   *
-   */
-  applyPatch,
-  /**
-   * Custom tools let callers constrain model output to a grammar (regex or
-   * Lark syntax). The model returns a `custom_tool_call` output item whose
-   * `input` field is a string matching the specified grammar.
-   *
-   * @param name - The name of the custom tool.
-   * @param description - An optional description of the tool.
-   * @param format - The output format constraint (grammar type, syntax, and definition).
-   */
-  customTool,
-  /**
-   * The Code Interpreter tool allows models to write and run Python code in a
-   * sandboxed environment to solve complex problems in domains like data analysis,
-   * coding, and math.
-   *
-   * @param container - The container to use for the code interpreter.
-   */
-  codeInterpreter,
-  /**
-   * File search is a tool available in the Responses API. It enables models to
-   * retrieve information in a knowledge base of previously uploaded files through
-   * semantic and keyword search.
-   *
-   * @param vectorStoreIds - The vector store IDs to use for the file search.
-   * @param maxNumResults - The maximum number of results to return.
-   * @param ranking - The ranking options to use for the file search.
-   * @param filters - The filters to use for the file search.
-   */
-  fileSearch,
-  /**
-   * The image generation tool allows you to generate images using a text prompt,
-   * and optionally image inputs. It leverages the GPT Image model,
-   * and automatically optimizes text inputs for improved performance.
-   *
-   * @param background - Background type for the generated image. One of 'auto', 'opaque', or 'transparent'.
-   * @param inputFidelity - Input fidelity for the generated image. One of 'low' or 'high'.
-   * @param inputImageMask - Optional mask for inpainting. Contains fileId and/or imageUrl.
-   * @param model - The image generation model to use. Default: gpt-image-1.
-   * @param moderation - Moderation level for the generated image. Default: 'auto'.
-   * @param outputCompression - Compression level for the output image (0-100).
-   * @param outputFormat - The output format of the generated image. One of 'png', 'jpeg', or 'webp'.
-   * @param partialImages - Number of partial images to generate in streaming mode (0-3).
-   * @param quality - The quality of the generated image. One of 'auto', 'low', 'medium', or 'high'.
-   * @param size - The size of the generated image. One of 'auto', '1024x1024', '1024x1536', or '1536x1024'.
-   */
-  imageGeneration,
-  /**
-   * Local shell is a tool that allows agents to run shell commands locally
-   * on a machine you or the user provides.
-   *
-   * Supported models: `gpt-5-codex`
-   */
-  localShell,
-  /**
-   * The shell tool allows the model to interact with your local computer through
-   * a controlled command-line interface. The model proposes shell commands; your
-   * integration executes them and returns the outputs.
-   *
-   * Available through the Responses API for use with GPT-5.1.
-   *
-   * WARNING: Running arbitrary shell commands can be dangerous. Always sandbox
-   * execution or add strict allow-/deny-lists before forwarding a command to
-   * the system shell.
-   */
-  shell,
-  /**
-   * Web search allows models to access up-to-date information from the internet
-   * and provide answers with sourced citations.
-   *
-   * @param searchContextSize - The search context size to use for the web search.
-   * @param userLocation - The user location to use for the web search.
-   */
-  webSearchPreview,
-  /**
-   * Web search allows models to access up-to-date information from the internet
-   * and provide answers with sourced citations.
-   *
-   * @param filters - The filters to use for the web search.
-   * @param searchContextSize - The search context size to use for the web search.
-   * @param userLocation - The user location to use for the web search.
-   */
-  webSearch,
-  /**
-   * MCP (Model Context Protocol) allows models to call tools exposed by
-   * remote MCP servers or service connectors.
-   *
-   * @param serverLabel - Label to identify the MCP server.
-   * @param allowedTools - Allowed tool names or filter object.
-   * @param authorization - OAuth access token for the MCP server/connector.
-   * @param connectorId - Identifier for a service connector.
-   * @param headers - Optional headers to include in MCP requests.
-   * // param requireApproval - Approval policy ('always'|'never'|filter object). (Removed - always 'never')
-   * @param serverDescription - Optional description of the server.
-   * @param serverUrl - URL for the MCP server.
-   */
-  mcp
-};
-function convertOpenAIResponsesUsage(usage) {
-  var _a21, _b17, _c, _d;
-  if (usage == null) {
-    return {
-      inputTokens: {
-        total: void 0,
-        noCache: void 0,
-        cacheRead: void 0,
-        cacheWrite: void 0
-      },
-      outputTokens: {
-        total: void 0,
-        text: void 0,
-        reasoning: void 0
-      },
-      raw: void 0
-    };
-  }
-  const inputTokens = usage.input_tokens;
-  const outputTokens = usage.output_tokens;
-  const cachedTokens = (_b17 = (_a21 = usage.input_tokens_details) == null ? void 0 : _a21.cached_tokens) != null ? _b17 : 0;
-  const reasoningTokens = (_d = (_c = usage.output_tokens_details) == null ? void 0 : _c.reasoning_tokens) != null ? _d : 0;
-  return {
-    inputTokens: {
-      total: inputTokens,
-      noCache: inputTokens - cachedTokens,
-      cacheRead: cachedTokens,
-      cacheWrite: void 0
-    },
-    outputTokens: {
-      total: outputTokens,
-      text: outputTokens - reasoningTokens,
-      reasoning: reasoningTokens
-    },
-    raw: usage
+function toCamelCase(str) {
+  return str.replace(/[_-]([a-z])/g, (g2) => g2[1].toUpperCase());
+}
+__name(toCamelCase, "toCamelCase");
+var VERSION4 = true ? "2.0.35" : "0.0.0-test";
+function createOpenAICompatible(options) {
+  const baseURL = withoutTrailingSlash(options.baseURL);
+  const providerName = options.name;
+  const headers = {
+    ...options.apiKey && { Authorization: `Bearer ${options.apiKey}` },
+    ...options.headers
   };
-}
-__name(convertOpenAIResponsesUsage, "convertOpenAIResponsesUsage");
-function isFileId(data, prefixes) {
-  if (!prefixes) return false;
-  return prefixes.some((prefix) => data.startsWith(prefix));
-}
-__name(isFileId, "isFileId");
-async function convertToOpenAIResponsesInput({
-  prompt,
-  toolNameMapping,
-  systemMessageMode,
-  providerOptionsName,
-  fileIdPrefixes,
-  store,
-  hasConversation = false,
-  hasLocalShellTool = false,
-  hasShellTool = false,
-  hasApplyPatchTool = false,
-  customProviderToolNames
-}) {
-  var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i, _j, _k, _l, _m;
-  const input = [];
-  const warnings = [];
-  const processedApprovalIds = /* @__PURE__ */ new Set();
-  for (const { role, content } of prompt) {
-    switch (role) {
-      case "system": {
-        switch (systemMessageMode) {
-          case "system": {
-            input.push({ role: "system", content });
-            break;
-          }
-          case "developer": {
-            input.push({ role: "developer", content });
-            break;
-          }
-          case "remove": {
-            warnings.push({
-              type: "other",
-              message: "system messages are removed for this model"
-            });
-            break;
-          }
-          default: {
-            const _exhaustiveCheck = systemMessageMode;
-            throw new Error(
-              `Unsupported system message mode: ${_exhaustiveCheck}`
-            );
-          }
-        }
-        break;
+  const getHeaders = /* @__PURE__ */ __name(() => withUserAgentSuffix(headers, `ai-sdk/openai-compatible/${VERSION4}`), "getHeaders");
+  const getCommonModelConfig = /* @__PURE__ */ __name((modelType) => ({
+    provider: `${providerName}.${modelType}`,
+    url: /* @__PURE__ */ __name(({ path }) => {
+      const url2 = new URL(`${baseURL}${path}`);
+      if (options.queryParams) {
+        url2.search = new URLSearchParams(options.queryParams).toString();
       }
-      case "user": {
-        input.push({
-          role: "user",
-          content: content.map((part, index) => {
-            var _a24, _b23, _c2;
-            switch (part.type) {
-              case "text": {
-                return { type: "input_text", text: part.text };
-              }
-              case "file": {
-                if (part.mediaType.startsWith("image/")) {
-                  const mediaType = part.mediaType === "image/*" ? "image/jpeg" : part.mediaType;
-                  return {
-                    type: "input_image",
-                    ...part.data instanceof URL ? { image_url: part.data.toString() } : typeof part.data === "string" && isFileId(part.data, fileIdPrefixes) ? { file_id: part.data } : {
-                      image_url: `data:${mediaType};base64,${convertToBase64(part.data)}`
-                    },
-                    detail: (_b23 = (_a24 = part.providerOptions) == null ? void 0 : _a24[providerOptionsName]) == null ? void 0 : _b23.imageDetail
-                  };
-                } else if (part.mediaType === "application/pdf") {
-                  if (part.data instanceof URL) {
-                    return {
-                      type: "input_file",
-                      file_url: part.data.toString()
-                    };
-                  }
-                  return {
-                    type: "input_file",
-                    ...typeof part.data === "string" && isFileId(part.data, fileIdPrefixes) ? { file_id: part.data } : {
-                      filename: (_c2 = part.filename) != null ? _c2 : `part-${index}.pdf`,
-                      file_data: `data:application/pdf;base64,${convertToBase64(part.data)}`
-                    }
-                  };
-                } else {
-                  throw new UnsupportedFunctionalityError({
-                    functionality: `file part media type ${part.mediaType}`
-                  });
-                }
-              }
-            }
-          })
-        });
-        break;
-      }
-      case "assistant": {
-        const reasoningMessages = {};
-        for (const part of content) {
-          switch (part.type) {
-            case "text": {
-              const providerOpts = (_a21 = part.providerOptions) == null ? void 0 : _a21[providerOptionsName];
-              const id = providerOpts == null ? void 0 : providerOpts.itemId;
-              const phase = providerOpts == null ? void 0 : providerOpts.phase;
-              if (hasConversation && id != null) {
-                break;
-              }
-              if (store && id != null) {
-                input.push({ type: "item_reference", id });
-                break;
-              }
-              input.push({
-                role: "assistant",
-                content: [{ type: "output_text", text: part.text }],
-                id,
-                ...phase != null && { phase }
-              });
-              break;
-            }
-            case "tool-call": {
-              const id = (_f = (_c = (_b17 = part.providerOptions) == null ? void 0 : _b17[providerOptionsName]) == null ? void 0 : _c.itemId) != null ? _f : (_e2 = (_d = part.providerMetadata) == null ? void 0 : _d[providerOptionsName]) == null ? void 0 : _e2.itemId;
-              if (hasConversation && id != null) {
-                break;
-              }
-              if (part.providerExecuted) {
-                if (store && id != null) {
-                  input.push({ type: "item_reference", id });
-                }
-                break;
-              }
-              if (store && id != null) {
-                input.push({ type: "item_reference", id });
-                break;
-              }
-              const resolvedToolName = toolNameMapping.toProviderToolName(
-                part.toolName
-              );
-              if (hasLocalShellTool && resolvedToolName === "local_shell") {
-                const parsedInput = await validateTypes({
-                  value: part.input,
-                  schema: localShellInputSchema
-                });
-                input.push({
-                  type: "local_shell_call",
-                  call_id: part.toolCallId,
-                  id,
-                  action: {
-                    type: "exec",
-                    command: parsedInput.action.command,
-                    timeout_ms: parsedInput.action.timeoutMs,
-                    user: parsedInput.action.user,
-                    working_directory: parsedInput.action.workingDirectory,
-                    env: parsedInput.action.env
-                  }
-                });
-                break;
-              }
-              if (hasShellTool && resolvedToolName === "shell") {
-                const parsedInput = await validateTypes({
-                  value: part.input,
-                  schema: shellInputSchema
-                });
-                input.push({
-                  type: "shell_call",
-                  call_id: part.toolCallId,
-                  id,
-                  status: "completed",
-                  action: {
-                    commands: parsedInput.action.commands,
-                    timeout_ms: parsedInput.action.timeoutMs,
-                    max_output_length: parsedInput.action.maxOutputLength
-                  }
-                });
-                break;
-              }
-              if (hasApplyPatchTool && resolvedToolName === "apply_patch") {
-                const parsedInput = await validateTypes({
-                  value: part.input,
-                  schema: applyPatchInputSchema
-                });
-                input.push({
-                  type: "apply_patch_call",
-                  call_id: parsedInput.callId,
-                  id,
-                  status: "completed",
-                  operation: parsedInput.operation
-                });
-                break;
-              }
-              if (customProviderToolNames == null ? void 0 : customProviderToolNames.has(resolvedToolName)) {
-                input.push({
-                  type: "custom_tool_call",
-                  call_id: part.toolCallId,
-                  name: resolvedToolName,
-                  input: typeof part.input === "string" ? part.input : JSON.stringify(part.input),
-                  id
-                });
-                break;
-              }
-              input.push({
-                type: "function_call",
-                call_id: part.toolCallId,
-                name: resolvedToolName,
-                arguments: JSON.stringify(part.input),
-                id
-              });
-              break;
-            }
-            // assistant tool result parts are from provider-executed tools:
-            case "tool-result": {
-              if (part.output.type === "execution-denied" || part.output.type === "json" && typeof part.output.value === "object" && part.output.value != null && "type" in part.output.value && part.output.value.type === "execution-denied") {
-                break;
-              }
-              if (hasConversation) {
-                break;
-              }
-              const resolvedResultToolName = toolNameMapping.toProviderToolName(
-                part.toolName
-              );
-              if (hasShellTool && resolvedResultToolName === "shell") {
-                if (part.output.type === "json") {
-                  const parsedOutput = await validateTypes({
-                    value: part.output.value,
-                    schema: shellOutputSchema
-                  });
-                  input.push({
-                    type: "shell_call_output",
-                    call_id: part.toolCallId,
-                    output: parsedOutput.output.map((item) => ({
-                      stdout: item.stdout,
-                      stderr: item.stderr,
-                      outcome: item.outcome.type === "timeout" ? { type: "timeout" } : {
-                        type: "exit",
-                        exit_code: item.outcome.exitCode
-                      }
-                    }))
-                  });
-                }
-                break;
-              }
-              if (store) {
-                const itemId = (_i = (_h = (_g = part.providerOptions) == null ? void 0 : _g[providerOptionsName]) == null ? void 0 : _h.itemId) != null ? _i : part.toolCallId;
-                input.push({ type: "item_reference", id: itemId });
-              } else {
-                warnings.push({
-                  type: "other",
-                  message: `Results for OpenAI tool ${part.toolName} are not sent to the API when store is false`
-                });
-              }
-              break;
-            }
-            case "reasoning": {
-              const providerOptions = await parseProviderOptions({
-                provider: providerOptionsName,
-                providerOptions: part.providerOptions,
-                schema: openaiResponsesReasoningProviderOptionsSchema
-              });
-              const reasoningId = providerOptions == null ? void 0 : providerOptions.itemId;
-              if (hasConversation && reasoningId != null) {
-                break;
-              }
-              if (reasoningId != null) {
-                const reasoningMessage = reasoningMessages[reasoningId];
-                if (store) {
-                  if (reasoningMessage === void 0) {
-                    input.push({ type: "item_reference", id: reasoningId });
-                    reasoningMessages[reasoningId] = {
-                      type: "reasoning",
-                      id: reasoningId,
-                      summary: []
-                    };
-                  }
-                } else {
-                  const summaryParts = [];
-                  if (part.text.length > 0) {
-                    summaryParts.push({
-                      type: "summary_text",
-                      text: part.text
-                    });
-                  } else if (reasoningMessage !== void 0) {
-                    warnings.push({
-                      type: "other",
-                      message: `Cannot append empty reasoning part to existing reasoning sequence. Skipping reasoning part: ${JSON.stringify(part)}.`
-                    });
-                  }
-                  if (reasoningMessage === void 0) {
-                    reasoningMessages[reasoningId] = {
-                      type: "reasoning",
-                      id: reasoningId,
-                      encrypted_content: providerOptions == null ? void 0 : providerOptions.reasoningEncryptedContent,
-                      summary: summaryParts
-                    };
-                    input.push(reasoningMessages[reasoningId]);
-                  } else {
-                    reasoningMessage.summary.push(...summaryParts);
-                    if ((providerOptions == null ? void 0 : providerOptions.reasoningEncryptedContent) != null) {
-                      reasoningMessage.encrypted_content = providerOptions.reasoningEncryptedContent;
-                    }
-                  }
-                }
-              } else {
-                const encryptedContent = providerOptions == null ? void 0 : providerOptions.reasoningEncryptedContent;
-                if (encryptedContent != null) {
-                  const summaryParts = [];
-                  if (part.text.length > 0) {
-                    summaryParts.push({
-                      type: "summary_text",
-                      text: part.text
-                    });
-                  }
-                  input.push({
-                    type: "reasoning",
-                    encrypted_content: encryptedContent,
-                    summary: summaryParts
-                  });
-                } else {
-                  warnings.push({
-                    type: "other",
-                    message: `Non-OpenAI reasoning parts are not supported. Skipping reasoning part: ${JSON.stringify(part)}.`
-                  });
-                }
-              }
-              break;
-            }
-          }
-        }
-        break;
-      }
-      case "tool": {
-        for (const part of content) {
-          if (part.type === "tool-approval-response") {
-            const approvalResponse = part;
-            if (processedApprovalIds.has(approvalResponse.approvalId)) {
-              continue;
-            }
-            processedApprovalIds.add(approvalResponse.approvalId);
-            if (store) {
-              input.push({
-                type: "item_reference",
-                id: approvalResponse.approvalId
-              });
-            }
-            input.push({
-              type: "mcp_approval_response",
-              approval_request_id: approvalResponse.approvalId,
-              approve: approvalResponse.approved
-            });
-            continue;
-          }
-          const output = part.output;
-          if (output.type === "execution-denied") {
-            const approvalId = (_k = (_j = output.providerOptions) == null ? void 0 : _j.openai) == null ? void 0 : _k.approvalId;
-            if (approvalId) {
-              continue;
-            }
-          }
-          const resolvedToolName = toolNameMapping.toProviderToolName(
-            part.toolName
-          );
-          if (hasLocalShellTool && resolvedToolName === "local_shell" && output.type === "json") {
-            const parsedOutput = await validateTypes({
-              value: output.value,
-              schema: localShellOutputSchema
-            });
-            input.push({
-              type: "local_shell_call_output",
-              call_id: part.toolCallId,
-              output: parsedOutput.output
-            });
-            continue;
-          }
-          if (hasShellTool && resolvedToolName === "shell" && output.type === "json") {
-            const parsedOutput = await validateTypes({
-              value: output.value,
-              schema: shellOutputSchema
-            });
-            input.push({
-              type: "shell_call_output",
-              call_id: part.toolCallId,
-              output: parsedOutput.output.map((item) => ({
-                stdout: item.stdout,
-                stderr: item.stderr,
-                outcome: item.outcome.type === "timeout" ? { type: "timeout" } : {
-                  type: "exit",
-                  exit_code: item.outcome.exitCode
-                }
-              }))
-            });
-            continue;
-          }
-          if (hasApplyPatchTool && part.toolName === "apply_patch" && output.type === "json") {
-            const parsedOutput = await validateTypes({
-              value: output.value,
-              schema: applyPatchOutputSchema
-            });
-            input.push({
-              type: "apply_patch_call_output",
-              call_id: part.toolCallId,
-              status: parsedOutput.status,
-              output: parsedOutput.output
-            });
-            continue;
-          }
-          if (customProviderToolNames == null ? void 0 : customProviderToolNames.has(resolvedToolName)) {
-            let outputValue;
-            switch (output.type) {
-              case "text":
-              case "error-text":
-                outputValue = output.value;
-                break;
-              case "execution-denied":
-                outputValue = (_l = output.reason) != null ? _l : "Tool execution denied.";
-                break;
-              case "json":
-              case "error-json":
-                outputValue = JSON.stringify(output.value);
-                break;
-              case "content":
-                outputValue = output.value.map((item) => {
-                  var _a24;
-                  switch (item.type) {
-                    case "text":
-                      return { type: "input_text", text: item.text };
-                    case "image-data":
-                      return {
-                        type: "input_image",
-                        image_url: `data:${item.mediaType};base64,${item.data}`
-                      };
-                    case "image-url":
-                      return {
-                        type: "input_image",
-                        image_url: item.url
-                      };
-                    case "file-data":
-                      return {
-                        type: "input_file",
-                        filename: (_a24 = item.filename) != null ? _a24 : "data",
-                        file_data: `data:${item.mediaType};base64,${item.data}`
-                      };
-                    default:
-                      warnings.push({
-                        type: "other",
-                        message: `unsupported custom tool content part type: ${item.type}`
-                      });
-                      return void 0;
-                  }
-                }).filter(isNonNullable);
-                break;
-              default:
-                outputValue = "";
-            }
-            input.push({
-              type: "custom_tool_call_output",
-              call_id: part.toolCallId,
-              output: outputValue
-            });
-            continue;
-          }
-          let contentValue;
-          switch (output.type) {
-            case "text":
-            case "error-text":
-              contentValue = output.value;
-              break;
-            case "execution-denied":
-              contentValue = (_m = output.reason) != null ? _m : "Tool execution denied.";
-              break;
-            case "json":
-            case "error-json":
-              contentValue = JSON.stringify(output.value);
-              break;
-            case "content":
-              contentValue = output.value.map((item) => {
-                var _a24;
-                switch (item.type) {
-                  case "text": {
-                    return { type: "input_text", text: item.text };
-                  }
-                  case "image-data": {
-                    return {
-                      type: "input_image",
-                      image_url: `data:${item.mediaType};base64,${item.data}`
-                    };
-                  }
-                  case "image-url": {
-                    return {
-                      type: "input_image",
-                      image_url: item.url
-                    };
-                  }
-                  case "file-data": {
-                    return {
-                      type: "input_file",
-                      filename: (_a24 = item.filename) != null ? _a24 : "data",
-                      file_data: `data:${item.mediaType};base64,${item.data}`
-                    };
-                  }
-                  default: {
-                    warnings.push({
-                      type: "other",
-                      message: `unsupported tool content part type: ${item.type}`
-                    });
-                    return void 0;
-                  }
-                }
-              }).filter(isNonNullable);
-              break;
-          }
-          input.push({
-            type: "function_call_output",
-            call_id: part.toolCallId,
-            output: contentValue
-          });
-        }
-        break;
-      }
-      default: {
-        const _exhaustiveCheck = role;
-        throw new Error(`Unsupported role: ${_exhaustiveCheck}`);
-      }
-    }
-  }
-  return { input, warnings };
-}
-__name(convertToOpenAIResponsesInput, "convertToOpenAIResponsesInput");
-var openaiResponsesReasoningProviderOptionsSchema = external_exports.object({
-  itemId: external_exports.string().nullish(),
-  reasoningEncryptedContent: external_exports.string().nullish()
-});
-function mapOpenAIResponseFinishReason({
-  finishReason,
-  hasFunctionCall
-}) {
-  switch (finishReason) {
-    case void 0:
-    case null:
-      return hasFunctionCall ? "tool-calls" : "stop";
-    case "max_output_tokens":
-      return "length";
-    case "content_filter":
-      return "content-filter";
-    default:
-      return hasFunctionCall ? "tool-calls" : "other";
-  }
-}
-__name(mapOpenAIResponseFinishReason, "mapOpenAIResponseFinishReason");
-var openaiResponsesChunkSchema = lazySchema(
-  () => zodSchema(
-    external_exports.union([
-      external_exports.object({
-        type: external_exports.literal("response.output_text.delta"),
-        item_id: external_exports.string(),
-        delta: external_exports.string(),
-        logprobs: external_exports.array(
-          external_exports.object({
-            token: external_exports.string(),
-            logprob: external_exports.number(),
-            top_logprobs: external_exports.array(
-              external_exports.object({
-                token: external_exports.string(),
-                logprob: external_exports.number()
-              })
-            )
-          })
-        ).nullish()
-      }),
-      external_exports.object({
-        type: external_exports.enum(["response.completed", "response.incomplete"]),
-        response: external_exports.object({
-          incomplete_details: external_exports.object({ reason: external_exports.string() }).nullish(),
-          usage: external_exports.object({
-            input_tokens: external_exports.number(),
-            input_tokens_details: external_exports.object({ cached_tokens: external_exports.number().nullish() }).nullish(),
-            output_tokens: external_exports.number(),
-            output_tokens_details: external_exports.object({ reasoning_tokens: external_exports.number().nullish() }).nullish()
-          }),
-          service_tier: external_exports.string().nullish()
-        })
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.created"),
-        response: external_exports.object({
-          id: external_exports.string(),
-          created_at: external_exports.number(),
-          model: external_exports.string(),
-          service_tier: external_exports.string().nullish()
-        })
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.output_item.added"),
-        output_index: external_exports.number(),
-        item: external_exports.discriminatedUnion("type", [
-          external_exports.object({
-            type: external_exports.literal("message"),
-            id: external_exports.string(),
-            phase: external_exports.enum(["commentary", "final_answer"]).nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("reasoning"),
-            id: external_exports.string(),
-            encrypted_content: external_exports.string().nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("function_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            name: external_exports.string(),
-            arguments: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("web_search_call"),
-            id: external_exports.string(),
-            status: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("computer_call"),
-            id: external_exports.string(),
-            status: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("file_search_call"),
-            id: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("image_generation_call"),
-            id: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("code_interpreter_call"),
-            id: external_exports.string(),
-            container_id: external_exports.string(),
-            code: external_exports.string().nullable(),
-            outputs: external_exports.array(
-              external_exports.discriminatedUnion("type", [
-                external_exports.object({ type: external_exports.literal("logs"), logs: external_exports.string() }),
-                external_exports.object({ type: external_exports.literal("image"), url: external_exports.string() })
-              ])
-            ).nullable(),
-            status: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_call"),
-            id: external_exports.string(),
-            status: external_exports.string(),
-            approval_request_id: external_exports.string().nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_list_tools"),
-            id: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_approval_request"),
-            id: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("apply_patch_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed"]),
-            operation: external_exports.discriminatedUnion("type", [
-              external_exports.object({
-                type: external_exports.literal("create_file"),
-                path: external_exports.string(),
-                diff: external_exports.string()
-              }),
-              external_exports.object({
-                type: external_exports.literal("delete_file"),
-                path: external_exports.string()
-              }),
-              external_exports.object({
-                type: external_exports.literal("update_file"),
-                path: external_exports.string(),
-                diff: external_exports.string()
-              })
-            ])
-          }),
-          external_exports.object({
-            type: external_exports.literal("custom_tool_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            name: external_exports.string(),
-            input: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("shell_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed", "incomplete"]),
-            action: external_exports.object({
-              commands: external_exports.array(external_exports.string())
-            })
-          }),
-          external_exports.object({
-            type: external_exports.literal("shell_call_output"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed", "incomplete"]),
-            output: external_exports.array(
-              external_exports.object({
-                stdout: external_exports.string(),
-                stderr: external_exports.string(),
-                outcome: external_exports.discriminatedUnion("type", [
-                  external_exports.object({ type: external_exports.literal("timeout") }),
-                  external_exports.object({
-                    type: external_exports.literal("exit"),
-                    exit_code: external_exports.number()
-                  })
-                ])
-              })
-            )
-          })
-        ])
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.output_item.done"),
-        output_index: external_exports.number(),
-        item: external_exports.discriminatedUnion("type", [
-          external_exports.object({
-            type: external_exports.literal("message"),
-            id: external_exports.string(),
-            phase: external_exports.enum(["commentary", "final_answer"]).nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("reasoning"),
-            id: external_exports.string(),
-            encrypted_content: external_exports.string().nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("function_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            name: external_exports.string(),
-            arguments: external_exports.string(),
-            status: external_exports.literal("completed")
-          }),
-          external_exports.object({
-            type: external_exports.literal("custom_tool_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            name: external_exports.string(),
-            input: external_exports.string(),
-            status: external_exports.literal("completed")
-          }),
-          external_exports.object({
-            type: external_exports.literal("code_interpreter_call"),
-            id: external_exports.string(),
-            code: external_exports.string().nullable(),
-            container_id: external_exports.string(),
-            outputs: external_exports.array(
-              external_exports.discriminatedUnion("type", [
-                external_exports.object({ type: external_exports.literal("logs"), logs: external_exports.string() }),
-                external_exports.object({ type: external_exports.literal("image"), url: external_exports.string() })
-              ])
-            ).nullable()
-          }),
-          external_exports.object({
-            type: external_exports.literal("image_generation_call"),
-            id: external_exports.string(),
-            result: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("web_search_call"),
-            id: external_exports.string(),
-            status: external_exports.string(),
-            action: external_exports.discriminatedUnion("type", [
-              external_exports.object({
-                type: external_exports.literal("search"),
-                query: external_exports.string().nullish(),
-                sources: external_exports.array(
-                  external_exports.discriminatedUnion("type", [
-                    external_exports.object({ type: external_exports.literal("url"), url: external_exports.string() }),
-                    external_exports.object({ type: external_exports.literal("api"), name: external_exports.string() })
-                  ])
-                ).nullish()
-              }),
-              external_exports.object({
-                type: external_exports.literal("open_page"),
-                url: external_exports.string().nullish()
-              }),
-              external_exports.object({
-                type: external_exports.literal("find_in_page"),
-                url: external_exports.string().nullish(),
-                pattern: external_exports.string().nullish()
-              })
-            ]).nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("file_search_call"),
-            id: external_exports.string(),
-            queries: external_exports.array(external_exports.string()),
-            results: external_exports.array(
-              external_exports.object({
-                attributes: external_exports.record(
-                  external_exports.string(),
-                  external_exports.union([external_exports.string(), external_exports.number(), external_exports.boolean()])
-                ),
-                file_id: external_exports.string(),
-                filename: external_exports.string(),
-                score: external_exports.number(),
-                text: external_exports.string()
-              })
-            ).nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("local_shell_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            action: external_exports.object({
-              type: external_exports.literal("exec"),
-              command: external_exports.array(external_exports.string()),
-              timeout_ms: external_exports.number().optional(),
-              user: external_exports.string().optional(),
-              working_directory: external_exports.string().optional(),
-              env: external_exports.record(external_exports.string(), external_exports.string()).optional()
-            })
-          }),
-          external_exports.object({
-            type: external_exports.literal("computer_call"),
-            id: external_exports.string(),
-            status: external_exports.literal("completed")
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_call"),
-            id: external_exports.string(),
-            status: external_exports.string(),
-            arguments: external_exports.string(),
-            name: external_exports.string(),
-            server_label: external_exports.string(),
-            output: external_exports.string().nullish(),
-            error: external_exports.union([
-              external_exports.string(),
-              external_exports.object({
-                type: external_exports.string().optional(),
-                code: external_exports.union([external_exports.number(), external_exports.string()]).optional(),
-                message: external_exports.string().optional()
-              }).loose()
-            ]).nullish(),
-            approval_request_id: external_exports.string().nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_list_tools"),
-            id: external_exports.string(),
-            server_label: external_exports.string(),
-            tools: external_exports.array(
-              external_exports.object({
-                name: external_exports.string(),
-                description: external_exports.string().optional(),
-                input_schema: external_exports.any(),
-                annotations: external_exports.record(external_exports.string(), external_exports.unknown()).optional()
-              })
-            ),
-            error: external_exports.union([
-              external_exports.string(),
-              external_exports.object({
-                type: external_exports.string().optional(),
-                code: external_exports.union([external_exports.number(), external_exports.string()]).optional(),
-                message: external_exports.string().optional()
-              }).loose()
-            ]).optional()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_approval_request"),
-            id: external_exports.string(),
-            server_label: external_exports.string(),
-            name: external_exports.string(),
-            arguments: external_exports.string(),
-            approval_request_id: external_exports.string().optional()
-          }),
-          external_exports.object({
-            type: external_exports.literal("apply_patch_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed"]),
-            operation: external_exports.discriminatedUnion("type", [
-              external_exports.object({
-                type: external_exports.literal("create_file"),
-                path: external_exports.string(),
-                diff: external_exports.string()
-              }),
-              external_exports.object({
-                type: external_exports.literal("delete_file"),
-                path: external_exports.string()
-              }),
-              external_exports.object({
-                type: external_exports.literal("update_file"),
-                path: external_exports.string(),
-                diff: external_exports.string()
-              })
-            ])
-          }),
-          external_exports.object({
-            type: external_exports.literal("shell_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed", "incomplete"]),
-            action: external_exports.object({
-              commands: external_exports.array(external_exports.string())
-            })
-          }),
-          external_exports.object({
-            type: external_exports.literal("shell_call_output"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed", "incomplete"]),
-            output: external_exports.array(
-              external_exports.object({
-                stdout: external_exports.string(),
-                stderr: external_exports.string(),
-                outcome: external_exports.discriminatedUnion("type", [
-                  external_exports.object({ type: external_exports.literal("timeout") }),
-                  external_exports.object({
-                    type: external_exports.literal("exit"),
-                    exit_code: external_exports.number()
-                  })
-                ])
-              })
-            )
-          })
-        ])
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.function_call_arguments.delta"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        delta: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.custom_tool_call_input.delta"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        delta: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.image_generation_call.partial_image"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        partial_image_b64: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.code_interpreter_call_code.delta"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        delta: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.code_interpreter_call_code.done"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        code: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.output_text.annotation.added"),
-        annotation: external_exports.discriminatedUnion("type", [
-          external_exports.object({
-            type: external_exports.literal("url_citation"),
-            start_index: external_exports.number(),
-            end_index: external_exports.number(),
-            url: external_exports.string(),
-            title: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("file_citation"),
-            file_id: external_exports.string(),
-            filename: external_exports.string(),
-            index: external_exports.number()
-          }),
-          external_exports.object({
-            type: external_exports.literal("container_file_citation"),
-            container_id: external_exports.string(),
-            file_id: external_exports.string(),
-            filename: external_exports.string(),
-            start_index: external_exports.number(),
-            end_index: external_exports.number()
-          }),
-          external_exports.object({
-            type: external_exports.literal("file_path"),
-            file_id: external_exports.string(),
-            index: external_exports.number()
-          })
-        ])
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.reasoning_summary_part.added"),
-        item_id: external_exports.string(),
-        summary_index: external_exports.number()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.reasoning_summary_text.delta"),
-        item_id: external_exports.string(),
-        summary_index: external_exports.number(),
-        delta: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.reasoning_summary_part.done"),
-        item_id: external_exports.string(),
-        summary_index: external_exports.number()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.apply_patch_call_operation_diff.delta"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        delta: external_exports.string(),
-        obfuscation: external_exports.string().nullish()
-      }),
-      external_exports.object({
-        type: external_exports.literal("response.apply_patch_call_operation_diff.done"),
-        item_id: external_exports.string(),
-        output_index: external_exports.number(),
-        diff: external_exports.string()
-      }),
-      external_exports.object({
-        type: external_exports.literal("error"),
-        sequence_number: external_exports.number(),
-        error: external_exports.object({
-          type: external_exports.string(),
-          code: external_exports.string(),
-          message: external_exports.string(),
-          param: external_exports.string().nullish()
-        })
-      }),
-      external_exports.object({ type: external_exports.string() }).loose().transform((value) => ({
-        type: "unknown_chunk",
-        message: value.type
-      }))
-      // fallback for unknown chunks
-    ])
-  )
-);
-var openaiResponsesResponseSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      id: external_exports.string().optional(),
-      created_at: external_exports.number().optional(),
-      error: external_exports.object({
-        message: external_exports.string(),
-        type: external_exports.string(),
-        param: external_exports.string().nullish(),
-        code: external_exports.string()
-      }).nullish(),
-      model: external_exports.string().optional(),
-      output: external_exports.array(
-        external_exports.discriminatedUnion("type", [
-          external_exports.object({
-            type: external_exports.literal("message"),
-            role: external_exports.literal("assistant"),
-            id: external_exports.string(),
-            phase: external_exports.enum(["commentary", "final_answer"]).nullish(),
-            content: external_exports.array(
-              external_exports.object({
-                type: external_exports.literal("output_text"),
-                text: external_exports.string(),
-                logprobs: external_exports.array(
-                  external_exports.object({
-                    token: external_exports.string(),
-                    logprob: external_exports.number(),
-                    top_logprobs: external_exports.array(
-                      external_exports.object({
-                        token: external_exports.string(),
-                        logprob: external_exports.number()
-                      })
-                    )
-                  })
-                ).nullish(),
-                annotations: external_exports.array(
-                  external_exports.discriminatedUnion("type", [
-                    external_exports.object({
-                      type: external_exports.literal("url_citation"),
-                      start_index: external_exports.number(),
-                      end_index: external_exports.number(),
-                      url: external_exports.string(),
-                      title: external_exports.string()
-                    }),
-                    external_exports.object({
-                      type: external_exports.literal("file_citation"),
-                      file_id: external_exports.string(),
-                      filename: external_exports.string(),
-                      index: external_exports.number()
-                    }),
-                    external_exports.object({
-                      type: external_exports.literal("container_file_citation"),
-                      container_id: external_exports.string(),
-                      file_id: external_exports.string(),
-                      filename: external_exports.string(),
-                      start_index: external_exports.number(),
-                      end_index: external_exports.number()
-                    }),
-                    external_exports.object({
-                      type: external_exports.literal("file_path"),
-                      file_id: external_exports.string(),
-                      index: external_exports.number()
-                    })
-                  ])
-                )
-              })
-            )
-          }),
-          external_exports.object({
-            type: external_exports.literal("web_search_call"),
-            id: external_exports.string(),
-            status: external_exports.string(),
-            action: external_exports.discriminatedUnion("type", [
-              external_exports.object({
-                type: external_exports.literal("search"),
-                query: external_exports.string().nullish(),
-                sources: external_exports.array(
-                  external_exports.discriminatedUnion("type", [
-                    external_exports.object({ type: external_exports.literal("url"), url: external_exports.string() }),
-                    external_exports.object({
-                      type: external_exports.literal("api"),
-                      name: external_exports.string()
-                    })
-                  ])
-                ).nullish()
-              }),
-              external_exports.object({
-                type: external_exports.literal("open_page"),
-                url: external_exports.string().nullish()
-              }),
-              external_exports.object({
-                type: external_exports.literal("find_in_page"),
-                url: external_exports.string().nullish(),
-                pattern: external_exports.string().nullish()
-              })
-            ]).nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("file_search_call"),
-            id: external_exports.string(),
-            queries: external_exports.array(external_exports.string()),
-            results: external_exports.array(
-              external_exports.object({
-                attributes: external_exports.record(
-                  external_exports.string(),
-                  external_exports.union([external_exports.string(), external_exports.number(), external_exports.boolean()])
-                ),
-                file_id: external_exports.string(),
-                filename: external_exports.string(),
-                score: external_exports.number(),
-                text: external_exports.string()
-              })
-            ).nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("code_interpreter_call"),
-            id: external_exports.string(),
-            code: external_exports.string().nullable(),
-            container_id: external_exports.string(),
-            outputs: external_exports.array(
-              external_exports.discriminatedUnion("type", [
-                external_exports.object({ type: external_exports.literal("logs"), logs: external_exports.string() }),
-                external_exports.object({ type: external_exports.literal("image"), url: external_exports.string() })
-              ])
-            ).nullable()
-          }),
-          external_exports.object({
-            type: external_exports.literal("image_generation_call"),
-            id: external_exports.string(),
-            result: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("local_shell_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            action: external_exports.object({
-              type: external_exports.literal("exec"),
-              command: external_exports.array(external_exports.string()),
-              timeout_ms: external_exports.number().optional(),
-              user: external_exports.string().optional(),
-              working_directory: external_exports.string().optional(),
-              env: external_exports.record(external_exports.string(), external_exports.string()).optional()
-            })
-          }),
-          external_exports.object({
-            type: external_exports.literal("function_call"),
-            call_id: external_exports.string(),
-            name: external_exports.string(),
-            arguments: external_exports.string(),
-            id: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("custom_tool_call"),
-            call_id: external_exports.string(),
-            name: external_exports.string(),
-            input: external_exports.string(),
-            id: external_exports.string()
-          }),
-          external_exports.object({
-            type: external_exports.literal("computer_call"),
-            id: external_exports.string(),
-            status: external_exports.string().optional()
-          }),
-          external_exports.object({
-            type: external_exports.literal("reasoning"),
-            id: external_exports.string(),
-            encrypted_content: external_exports.string().nullish(),
-            summary: external_exports.array(
-              external_exports.object({
-                type: external_exports.literal("summary_text"),
-                text: external_exports.string()
-              })
-            )
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_call"),
-            id: external_exports.string(),
-            status: external_exports.string(),
-            arguments: external_exports.string(),
-            name: external_exports.string(),
-            server_label: external_exports.string(),
-            output: external_exports.string().nullish(),
-            error: external_exports.union([
-              external_exports.string(),
-              external_exports.object({
-                type: external_exports.string().optional(),
-                code: external_exports.union([external_exports.number(), external_exports.string()]).optional(),
-                message: external_exports.string().optional()
-              }).loose()
-            ]).nullish(),
-            approval_request_id: external_exports.string().nullish()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_list_tools"),
-            id: external_exports.string(),
-            server_label: external_exports.string(),
-            tools: external_exports.array(
-              external_exports.object({
-                name: external_exports.string(),
-                description: external_exports.string().optional(),
-                input_schema: external_exports.any(),
-                annotations: external_exports.record(external_exports.string(), external_exports.unknown()).optional()
-              })
-            ),
-            error: external_exports.union([
-              external_exports.string(),
-              external_exports.object({
-                type: external_exports.string().optional(),
-                code: external_exports.union([external_exports.number(), external_exports.string()]).optional(),
-                message: external_exports.string().optional()
-              }).loose()
-            ]).optional()
-          }),
-          external_exports.object({
-            type: external_exports.literal("mcp_approval_request"),
-            id: external_exports.string(),
-            server_label: external_exports.string(),
-            name: external_exports.string(),
-            arguments: external_exports.string(),
-            approval_request_id: external_exports.string().optional()
-          }),
-          external_exports.object({
-            type: external_exports.literal("apply_patch_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed"]),
-            operation: external_exports.discriminatedUnion("type", [
-              external_exports.object({
-                type: external_exports.literal("create_file"),
-                path: external_exports.string(),
-                diff: external_exports.string()
-              }),
-              external_exports.object({
-                type: external_exports.literal("delete_file"),
-                path: external_exports.string()
-              }),
-              external_exports.object({
-                type: external_exports.literal("update_file"),
-                path: external_exports.string(),
-                diff: external_exports.string()
-              })
-            ])
-          }),
-          external_exports.object({
-            type: external_exports.literal("shell_call"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed", "incomplete"]),
-            action: external_exports.object({
-              commands: external_exports.array(external_exports.string())
-            })
-          }),
-          external_exports.object({
-            type: external_exports.literal("shell_call_output"),
-            id: external_exports.string(),
-            call_id: external_exports.string(),
-            status: external_exports.enum(["in_progress", "completed", "incomplete"]),
-            output: external_exports.array(
-              external_exports.object({
-                stdout: external_exports.string(),
-                stderr: external_exports.string(),
-                outcome: external_exports.discriminatedUnion("type", [
-                  external_exports.object({ type: external_exports.literal("timeout") }),
-                  external_exports.object({
-                    type: external_exports.literal("exit"),
-                    exit_code: external_exports.number()
-                  })
-                ])
-              })
-            )
-          })
-        ])
-      ).optional(),
-      service_tier: external_exports.string().nullish(),
-      incomplete_details: external_exports.object({ reason: external_exports.string() }).nullish(),
-      usage: external_exports.object({
-        input_tokens: external_exports.number(),
-        input_tokens_details: external_exports.object({ cached_tokens: external_exports.number().nullish() }).nullish(),
-        output_tokens: external_exports.number(),
-        output_tokens_details: external_exports.object({ reasoning_tokens: external_exports.number().nullish() }).nullish()
-      }).optional()
-    })
-  )
-);
-var TOP_LOGPROBS_MAX = 20;
-var openaiResponsesReasoningModelIds = [
-  "o1",
-  "o1-2024-12-17",
-  "o3",
-  "o3-2025-04-16",
-  "o3-mini",
-  "o3-mini-2025-01-31",
-  "o4-mini",
-  "o4-mini-2025-04-16",
-  "gpt-5",
-  "gpt-5-2025-08-07",
-  "gpt-5-codex",
-  "gpt-5-mini",
-  "gpt-5-mini-2025-08-07",
-  "gpt-5-nano",
-  "gpt-5-nano-2025-08-07",
-  "gpt-5-pro",
-  "gpt-5-pro-2025-10-06",
-  "gpt-5.1",
-  "gpt-5.1-chat-latest",
-  "gpt-5.1-codex-mini",
-  "gpt-5.1-codex",
-  "gpt-5.1-codex-max",
-  "gpt-5.2",
-  "gpt-5.2-chat-latest",
-  "gpt-5.2-pro",
-  "gpt-5.2-codex",
-  "gpt-5.3-codex"
-];
-var openaiResponsesModelIds = [
-  "gpt-4.1",
-  "gpt-4.1-2025-04-14",
-  "gpt-4.1-mini",
-  "gpt-4.1-mini-2025-04-14",
-  "gpt-4.1-nano",
-  "gpt-4.1-nano-2025-04-14",
-  "gpt-4o",
-  "gpt-4o-2024-05-13",
-  "gpt-4o-2024-08-06",
-  "gpt-4o-2024-11-20",
-  "gpt-4o-audio-preview",
-  "gpt-4o-audio-preview-2024-12-17",
-  "gpt-4o-search-preview",
-  "gpt-4o-search-preview-2025-03-11",
-  "gpt-4o-mini-search-preview",
-  "gpt-4o-mini-search-preview-2025-03-11",
-  "gpt-4o-mini",
-  "gpt-4o-mini-2024-07-18",
-  "gpt-3.5-turbo-0125",
-  "gpt-3.5-turbo",
-  "gpt-3.5-turbo-1106",
-  "gpt-5-chat-latest",
-  ...openaiResponsesReasoningModelIds
-];
-var openaiLanguageModelResponsesOptionsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      /**
-       * The ID of the OpenAI Conversation to continue.
-       * You must create a conversation first via the OpenAI API.
-       * Cannot be used in conjunction with `previousResponseId`.
-       * Defaults to `undefined`.
-       * @see https://platform.openai.com/docs/api-reference/conversations/create
-       */
-      conversation: external_exports.string().nullish(),
-      /**
-       * The set of extra fields to include in the response (advanced, usually not needed).
-       * Example values: 'reasoning.encrypted_content', 'file_search_call.results', 'message.output_text.logprobs'.
-       */
-      include: external_exports.array(
-        external_exports.enum([
-          "reasoning.encrypted_content",
-          // handled internally by default, only needed for unknown reasoning models
-          "file_search_call.results",
-          "message.output_text.logprobs"
-        ])
-      ).nullish(),
-      /**
-       * Instructions for the model.
-       * They can be used to change the system or developer message when continuing a conversation using the `previousResponseId` option.
-       * Defaults to `undefined`.
-       */
-      instructions: external_exports.string().nullish(),
-      /**
-       * Return the log probabilities of the tokens. Including logprobs will increase
-       * the response size and can slow down response times. However, it can
-       * be useful to better understand how the model is behaving.
-       *
-       * Setting to true will return the log probabilities of the tokens that
-       * were generated.
-       *
-       * Setting to a number will return the log probabilities of the top n
-       * tokens that were generated.
-       *
-       * @see https://platform.openai.com/docs/api-reference/responses/create
-       * @see https://cookbook.openai.com/examples/using_logprobs
-       */
-      logprobs: external_exports.union([external_exports.boolean(), external_exports.number().min(1).max(TOP_LOGPROBS_MAX)]).optional(),
-      /**
-       * The maximum number of total calls to built-in tools that can be processed in a response.
-       * This maximum number applies across all built-in tool calls, not per individual tool.
-       * Any further attempts to call a tool by the model will be ignored.
-       */
-      maxToolCalls: external_exports.number().nullish(),
-      /**
-       * Additional metadata to store with the generation.
-       */
-      metadata: external_exports.any().nullish(),
-      /**
-       * Whether to use parallel tool calls. Defaults to `true`.
-       */
-      parallelToolCalls: external_exports.boolean().nullish(),
-      /**
-       * The ID of the previous response. You can use it to continue a conversation.
-       * Defaults to `undefined`.
-       */
-      previousResponseId: external_exports.string().nullish(),
-      /**
-       * Sets a cache key to tie this prompt to cached prefixes for better caching performance.
-       */
-      promptCacheKey: external_exports.string().nullish(),
-      /**
-       * The retention policy for the prompt cache.
-       * - 'in_memory': Default. Standard prompt caching behavior.
-       * - '24h': Extended prompt caching that keeps cached prefixes active for up to 24 hours.
-       *          Currently only available for 5.1 series models.
-       *
-       * @default 'in_memory'
-       */
-      promptCacheRetention: external_exports.enum(["in_memory", "24h"]).nullish(),
-      /**
-       * Reasoning effort for reasoning models. Defaults to `medium`. If you use
-       * `providerOptions` to set the `reasoningEffort` option, this model setting will be ignored.
-       * Valid values: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
-       *
-       * The 'none' type for `reasoningEffort` is only available for OpenAI's GPT-5.1
-       * models. Also, the 'xhigh' type for `reasoningEffort` is only available for
-       * OpenAI's GPT-5.1-Codex-Max model. Setting `reasoningEffort` to 'none' or 'xhigh' with unsupported models will result in
-       * an error.
-       */
-      reasoningEffort: external_exports.string().nullish(),
-      /**
-       * Controls reasoning summary output from the model.
-       * Set to "auto" to automatically receive the richest level available,
-       * or "detailed" for comprehensive summaries.
-       */
-      reasoningSummary: external_exports.string().nullish(),
-      /**
-       * The identifier for safety monitoring and tracking.
-       */
-      safetyIdentifier: external_exports.string().nullish(),
-      /**
-       * Service tier for the request.
-       * Set to 'flex' for 50% cheaper processing at the cost of increased latency (available for o3, o4-mini, and gpt-5 models).
-       * Set to 'priority' for faster processing with Enterprise access (available for gpt-4, gpt-5, gpt-5-mini, o3, o4-mini; gpt-5-nano is not supported).
-       *
-       * Defaults to 'auto'.
-       */
-      serviceTier: external_exports.enum(["auto", "flex", "priority", "default"]).nullish(),
-      /**
-       * Whether to store the generation. Defaults to `true`.
-       */
-      store: external_exports.boolean().nullish(),
-      /**
-       * Whether to use strict JSON schema validation.
-       * Defaults to `true`.
-       */
-      strictJsonSchema: external_exports.boolean().nullish(),
-      /**
-       * Controls the verbosity of the model's responses. Lower values ('low') will result
-       * in more concise responses, while higher values ('high') will result in more verbose responses.
-       * Valid values: 'low', 'medium', 'high'.
-       */
-      textVerbosity: external_exports.enum(["low", "medium", "high"]).nullish(),
-      /**
-       * Controls output truncation. 'auto' (default) performs truncation automatically;
-       * 'disabled' turns truncation off.
-       */
-      truncation: external_exports.enum(["auto", "disabled"]).nullish(),
-      /**
-       * A unique identifier representing your end-user, which can help OpenAI to
-       * monitor and detect abuse.
-       * Defaults to `undefined`.
-       * @see https://platform.openai.com/docs/guides/safety-best-practices/end-user-ids
-       */
-      user: external_exports.string().nullish(),
-      /**
-       * Override the system message mode for this model.
-       * - 'system': Use the 'system' role for system messages (default for most models)
-       * - 'developer': Use the 'developer' role for system messages (used by reasoning models)
-       * - 'remove': Remove system messages entirely
-       *
-       * If not specified, the mode is automatically determined based on the model.
-       */
-      systemMessageMode: external_exports.enum(["system", "developer", "remove"]).optional(),
-      /**
-       * Force treating this model as a reasoning model.
-       *
-       * This is useful for "stealth" reasoning models (e.g. via a custom baseURL)
-       * where the model ID is not recognized by the SDK's allowlist.
-       *
-       * When enabled, the SDK applies reasoning-model parameter compatibility rules
-       * and defaults `systemMessageMode` to `developer` unless overridden.
-       */
-      forceReasoning: external_exports.boolean().optional()
-    })
-  )
-);
-async function prepareResponsesTools({
-  tools,
-  toolChoice,
-  toolNameMapping,
-  customProviderToolNames
-}) {
-  var _a21;
-  tools = (tools == null ? void 0 : tools.length) ? tools : void 0;
-  const toolWarnings = [];
-  if (tools == null) {
-    return { tools: void 0, toolChoice: void 0, toolWarnings };
-  }
-  const openaiTools2 = [];
-  const resolvedCustomProviderToolNames = customProviderToolNames != null ? customProviderToolNames : /* @__PURE__ */ new Set();
-  for (const tool2 of tools) {
-    switch (tool2.type) {
-      case "function":
-        openaiTools2.push({
-          type: "function",
-          name: tool2.name,
-          description: tool2.description,
-          parameters: tool2.inputSchema,
-          ...tool2.strict != null ? { strict: tool2.strict } : {}
-        });
-        break;
-      case "provider": {
-        switch (tool2.id) {
-          case "openai.file_search": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: fileSearchArgsSchema
-            });
-            openaiTools2.push({
-              type: "file_search",
-              vector_store_ids: args.vectorStoreIds,
-              max_num_results: args.maxNumResults,
-              ranking_options: args.ranking ? {
-                ranker: args.ranking.ranker,
-                score_threshold: args.ranking.scoreThreshold
-              } : void 0,
-              filters: args.filters
-            });
-            break;
-          }
-          case "openai.local_shell": {
-            openaiTools2.push({
-              type: "local_shell"
-            });
-            break;
-          }
-          case "openai.shell": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: shellArgsSchema
-            });
-            openaiTools2.push({
-              type: "shell",
-              ...args.environment && {
-                environment: mapShellEnvironment(args.environment)
-              }
-            });
-            break;
-          }
-          case "openai.apply_patch": {
-            openaiTools2.push({
-              type: "apply_patch"
-            });
-            break;
-          }
-          case "openai.web_search_preview": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: webSearchPreviewArgsSchema
-            });
-            openaiTools2.push({
-              type: "web_search_preview",
-              search_context_size: args.searchContextSize,
-              user_location: args.userLocation
-            });
-            break;
-          }
-          case "openai.web_search": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: webSearchArgsSchema
-            });
-            openaiTools2.push({
-              type: "web_search",
-              filters: args.filters != null ? { allowed_domains: args.filters.allowedDomains } : void 0,
-              external_web_access: args.externalWebAccess,
-              search_context_size: args.searchContextSize,
-              user_location: args.userLocation
-            });
-            break;
-          }
-          case "openai.code_interpreter": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: codeInterpreterArgsSchema
-            });
-            openaiTools2.push({
-              type: "code_interpreter",
-              container: args.container == null ? { type: "auto", file_ids: void 0 } : typeof args.container === "string" ? args.container : { type: "auto", file_ids: args.container.fileIds }
-            });
-            break;
-          }
-          case "openai.image_generation": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: imageGenerationArgsSchema
-            });
-            openaiTools2.push({
-              type: "image_generation",
-              background: args.background,
-              input_fidelity: args.inputFidelity,
-              input_image_mask: args.inputImageMask ? {
-                file_id: args.inputImageMask.fileId,
-                image_url: args.inputImageMask.imageUrl
-              } : void 0,
-              model: args.model,
-              moderation: args.moderation,
-              partial_images: args.partialImages,
-              quality: args.quality,
-              output_compression: args.outputCompression,
-              output_format: args.outputFormat,
-              size: args.size
-            });
-            break;
-          }
-          case "openai.mcp": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: mcpArgsSchema
-            });
-            const mapApprovalFilter = /* @__PURE__ */ __name((filter2) => ({
-              tool_names: filter2.toolNames
-            }), "mapApprovalFilter");
-            const requireApproval = args.requireApproval;
-            const requireApprovalParam = requireApproval == null ? void 0 : typeof requireApproval === "string" ? requireApproval : requireApproval.never != null ? { never: mapApprovalFilter(requireApproval.never) } : void 0;
-            openaiTools2.push({
-              type: "mcp",
-              server_label: args.serverLabel,
-              allowed_tools: Array.isArray(args.allowedTools) ? args.allowedTools : args.allowedTools ? {
-                read_only: args.allowedTools.readOnly,
-                tool_names: args.allowedTools.toolNames
-              } : void 0,
-              authorization: args.authorization,
-              connector_id: args.connectorId,
-              headers: args.headers,
-              require_approval: requireApprovalParam != null ? requireApprovalParam : "never",
-              server_description: args.serverDescription,
-              server_url: args.serverUrl
-            });
-            break;
-          }
-          case "openai.custom": {
-            const args = await validateTypes({
-              value: tool2.args,
-              schema: customArgsSchema
-            });
-            openaiTools2.push({
-              type: "custom",
-              name: args.name,
-              description: args.description,
-              format: args.format
-            });
-            resolvedCustomProviderToolNames.add(args.name);
-            break;
-          }
-        }
-        break;
-      }
-      default:
-        toolWarnings.push({
-          type: "unsupported",
-          feature: `function tool ${tool2}`
-        });
-        break;
-    }
-  }
-  if (toolChoice == null) {
-    return { tools: openaiTools2, toolChoice: void 0, toolWarnings };
-  }
-  const type = toolChoice.type;
-  switch (type) {
-    case "auto":
-    case "none":
-    case "required":
-      return { tools: openaiTools2, toolChoice: type, toolWarnings };
-    case "tool": {
-      const resolvedToolName = (_a21 = toolNameMapping == null ? void 0 : toolNameMapping.toProviderToolName(toolChoice.toolName)) != null ? _a21 : toolChoice.toolName;
-      return {
-        tools: openaiTools2,
-        toolChoice: resolvedToolName === "code_interpreter" || resolvedToolName === "file_search" || resolvedToolName === "image_generation" || resolvedToolName === "web_search_preview" || resolvedToolName === "web_search" || resolvedToolName === "mcp" || resolvedToolName === "apply_patch" ? { type: resolvedToolName } : resolvedCustomProviderToolNames.has(resolvedToolName) ? { type: "custom", name: resolvedToolName } : { type: "function", name: resolvedToolName },
-        toolWarnings
-      };
-    }
-    default: {
-      const _exhaustiveCheck = type;
-      throw new UnsupportedFunctionalityError({
-        functionality: `tool choice type: ${_exhaustiveCheck}`
-      });
-    }
-  }
-}
-__name(prepareResponsesTools, "prepareResponsesTools");
-function mapShellEnvironment(environment) {
-  if (environment.type === "containerReference") {
-    const env2 = environment;
-    return {
-      type: "container_reference",
-      container_id: env2.containerId
-    };
-  }
-  if (environment.type === "containerAuto") {
-    const env2 = environment;
-    return {
-      type: "container_auto",
-      file_ids: env2.fileIds,
-      memory_limit: env2.memoryLimit,
-      network_policy: env2.networkPolicy == null ? void 0 : env2.networkPolicy.type === "disabled" ? { type: "disabled" } : {
-        type: "allowlist",
-        allowed_domains: env2.networkPolicy.allowedDomains,
-        domain_secrets: env2.networkPolicy.domainSecrets
-      },
-      skills: mapShellSkills(env2.skills)
-    };
-  }
-  const env = environment;
-  return {
-    type: "local",
-    skills: env.skills
-  };
-}
-__name(mapShellEnvironment, "mapShellEnvironment");
-function mapShellSkills(skills2) {
-  return skills2 == null ? void 0 : skills2.map(
-    (skill) => skill.type === "skillReference" ? {
-      type: "skill_reference",
-      skill_id: skill.skillId,
-      version: skill.version
-    } : {
-      type: "inline",
-      name: skill.name,
-      description: skill.description,
-      source: {
-        type: "base64",
-        media_type: skill.source.mediaType,
-        data: skill.source.data
-      }
-    }
-  );
-}
-__name(mapShellSkills, "mapShellSkills");
-function extractApprovalRequestIdToToolCallIdMapping(prompt) {
-  var _a21, _b17;
-  const mapping = {};
-  for (const message of prompt) {
-    if (message.role !== "assistant") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-call") continue;
-      const approvalRequestId = (_b17 = (_a21 = part.providerOptions) == null ? void 0 : _a21.openai) == null ? void 0 : _b17.approvalRequestId;
-      if (approvalRequestId != null) {
-        mapping[approvalRequestId] = part.toolCallId;
-      }
-    }
-  }
-  return mapping;
-}
-__name(extractApprovalRequestIdToToolCallIdMapping, "extractApprovalRequestIdToToolCallIdMapping");
-var OpenAIResponsesLanguageModel = class {
-  static {
-    __name(this, "OpenAIResponsesLanguageModel");
-  }
-  constructor(modelId, config2) {
-    this.specificationVersion = "v3";
-    this.supportedUrls = {
-      "image/*": [/^https?:\/\/.*$/],
-      "application/pdf": [/^https?:\/\/.*$/]
-    };
-    this.modelId = modelId;
-    this.config = config2;
-  }
-  get provider() {
-    return this.config.provider;
-  }
-  async getArgs({
-    maxOutputTokens,
-    temperature,
-    stopSequences,
-    topP,
-    topK,
-    presencePenalty,
-    frequencyPenalty,
-    seed,
-    prompt,
-    providerOptions,
-    tools,
-    toolChoice,
-    responseFormat
-  }) {
-    var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i;
-    const warnings = [];
-    const modelCapabilities = getOpenAILanguageModelCapabilities(this.modelId);
-    if (topK != null) {
-      warnings.push({ type: "unsupported", feature: "topK" });
-    }
-    if (seed != null) {
-      warnings.push({ type: "unsupported", feature: "seed" });
-    }
-    if (presencePenalty != null) {
-      warnings.push({ type: "unsupported", feature: "presencePenalty" });
-    }
-    if (frequencyPenalty != null) {
-      warnings.push({ type: "unsupported", feature: "frequencyPenalty" });
-    }
-    if (stopSequences != null) {
-      warnings.push({ type: "unsupported", feature: "stopSequences" });
-    }
-    const providerOptionsName = this.config.provider.includes("azure") ? "azure" : "openai";
-    let openaiOptions = await parseProviderOptions({
-      provider: providerOptionsName,
-      providerOptions,
-      schema: openaiLanguageModelResponsesOptionsSchema
-    });
-    if (openaiOptions == null && providerOptionsName !== "openai") {
-      openaiOptions = await parseProviderOptions({
-        provider: "openai",
-        providerOptions,
-        schema: openaiLanguageModelResponsesOptionsSchema
-      });
-    }
-    const isReasoningModel = (_a21 = openaiOptions == null ? void 0 : openaiOptions.forceReasoning) != null ? _a21 : modelCapabilities.isReasoningModel;
-    if ((openaiOptions == null ? void 0 : openaiOptions.conversation) && (openaiOptions == null ? void 0 : openaiOptions.previousResponseId)) {
-      warnings.push({
-        type: "unsupported",
-        feature: "conversation",
-        details: "conversation and previousResponseId cannot be used together"
-      });
-    }
-    const toolNameMapping = createToolNameMapping({
-      tools,
-      providerToolNames: {
-        "openai.code_interpreter": "code_interpreter",
-        "openai.file_search": "file_search",
-        "openai.image_generation": "image_generation",
-        "openai.local_shell": "local_shell",
-        "openai.shell": "shell",
-        "openai.web_search": "web_search",
-        "openai.web_search_preview": "web_search_preview",
-        "openai.mcp": "mcp",
-        "openai.apply_patch": "apply_patch"
-      },
-      resolveProviderToolName: /* @__PURE__ */ __name((tool2) => tool2.id === "openai.custom" ? tool2.args.name : void 0, "resolveProviderToolName")
-    });
-    const customProviderToolNames = /* @__PURE__ */ new Set();
-    const {
-      tools: openaiTools2,
-      toolChoice: openaiToolChoice,
-      toolWarnings
-    } = await prepareResponsesTools({
-      tools,
-      toolChoice,
-      toolNameMapping,
-      customProviderToolNames
-    });
-    const { input, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
-      prompt,
-      toolNameMapping,
-      systemMessageMode: (_b17 = openaiOptions == null ? void 0 : openaiOptions.systemMessageMode) != null ? _b17 : isReasoningModel ? "developer" : modelCapabilities.systemMessageMode,
-      providerOptionsName,
-      fileIdPrefixes: this.config.fileIdPrefixes,
-      store: (_c = openaiOptions == null ? void 0 : openaiOptions.store) != null ? _c : true,
-      hasConversation: (openaiOptions == null ? void 0 : openaiOptions.conversation) != null,
-      hasLocalShellTool: hasOpenAITool("openai.local_shell"),
-      hasShellTool: hasOpenAITool("openai.shell"),
-      hasApplyPatchTool: hasOpenAITool("openai.apply_patch"),
-      customProviderToolNames: customProviderToolNames.size > 0 ? customProviderToolNames : void 0
-    });
-    warnings.push(...inputWarnings);
-    const strictJsonSchema = (_d = openaiOptions == null ? void 0 : openaiOptions.strictJsonSchema) != null ? _d : true;
-    let include = openaiOptions == null ? void 0 : openaiOptions.include;
-    function addInclude(key) {
-      if (include == null) {
-        include = [key];
-      } else if (!include.includes(key)) {
-        include = [...include, key];
-      }
-    }
-    __name(addInclude, "addInclude");
-    function hasOpenAITool(id) {
-      return (tools == null ? void 0 : tools.find((tool2) => tool2.type === "provider" && tool2.id === id)) != null;
-    }
-    __name(hasOpenAITool, "hasOpenAITool");
-    const topLogprobs = typeof (openaiOptions == null ? void 0 : openaiOptions.logprobs) === "number" ? openaiOptions == null ? void 0 : openaiOptions.logprobs : (openaiOptions == null ? void 0 : openaiOptions.logprobs) === true ? TOP_LOGPROBS_MAX : void 0;
-    if (topLogprobs) {
-      addInclude("message.output_text.logprobs");
-    }
-    const webSearchToolName = (_e2 = tools == null ? void 0 : tools.find(
-      (tool2) => tool2.type === "provider" && (tool2.id === "openai.web_search" || tool2.id === "openai.web_search_preview")
-    )) == null ? void 0 : _e2.name;
-    if (webSearchToolName) {
-      addInclude("web_search_call.action.sources");
-    }
-    if (hasOpenAITool("openai.code_interpreter")) {
-      addInclude("code_interpreter_call.outputs");
-    }
-    const store = openaiOptions == null ? void 0 : openaiOptions.store;
-    if (store === false && isReasoningModel) {
-      addInclude("reasoning.encrypted_content");
-    }
-    const baseArgs = {
-      model: this.modelId,
-      input,
-      temperature,
-      top_p: topP,
-      max_output_tokens: maxOutputTokens,
-      ...((responseFormat == null ? void 0 : responseFormat.type) === "json" || (openaiOptions == null ? void 0 : openaiOptions.textVerbosity)) && {
-        text: {
-          ...(responseFormat == null ? void 0 : responseFormat.type) === "json" && {
-            format: responseFormat.schema != null ? {
-              type: "json_schema",
-              strict: strictJsonSchema,
-              name: (_f = responseFormat.name) != null ? _f : "response",
-              description: responseFormat.description,
-              schema: responseFormat.schema
-            } : { type: "json_object" }
-          },
-          ...(openaiOptions == null ? void 0 : openaiOptions.textVerbosity) && {
-            verbosity: openaiOptions.textVerbosity
-          }
-        }
-      },
-      // provider options:
-      conversation: openaiOptions == null ? void 0 : openaiOptions.conversation,
-      max_tool_calls: openaiOptions == null ? void 0 : openaiOptions.maxToolCalls,
-      metadata: openaiOptions == null ? void 0 : openaiOptions.metadata,
-      parallel_tool_calls: openaiOptions == null ? void 0 : openaiOptions.parallelToolCalls,
-      previous_response_id: openaiOptions == null ? void 0 : openaiOptions.previousResponseId,
-      store,
-      user: openaiOptions == null ? void 0 : openaiOptions.user,
-      instructions: openaiOptions == null ? void 0 : openaiOptions.instructions,
-      service_tier: openaiOptions == null ? void 0 : openaiOptions.serviceTier,
-      include,
-      prompt_cache_key: openaiOptions == null ? void 0 : openaiOptions.promptCacheKey,
-      prompt_cache_retention: openaiOptions == null ? void 0 : openaiOptions.promptCacheRetention,
-      safety_identifier: openaiOptions == null ? void 0 : openaiOptions.safetyIdentifier,
-      top_logprobs: topLogprobs,
-      truncation: openaiOptions == null ? void 0 : openaiOptions.truncation,
-      // model-specific settings:
-      ...isReasoningModel && ((openaiOptions == null ? void 0 : openaiOptions.reasoningEffort) != null || (openaiOptions == null ? void 0 : openaiOptions.reasoningSummary) != null) && {
-        reasoning: {
-          ...(openaiOptions == null ? void 0 : openaiOptions.reasoningEffort) != null && {
-            effort: openaiOptions.reasoningEffort
-          },
-          ...(openaiOptions == null ? void 0 : openaiOptions.reasoningSummary) != null && {
-            summary: openaiOptions.reasoningSummary
-          }
-        }
-      }
-    };
-    if (isReasoningModel) {
-      if (!((openaiOptions == null ? void 0 : openaiOptions.reasoningEffort) === "none" && modelCapabilities.supportsNonReasoningParameters)) {
-        if (baseArgs.temperature != null) {
-          baseArgs.temperature = void 0;
-          warnings.push({
-            type: "unsupported",
-            feature: "temperature",
-            details: "temperature is not supported for reasoning models"
-          });
-        }
-        if (baseArgs.top_p != null) {
-          baseArgs.top_p = void 0;
-          warnings.push({
-            type: "unsupported",
-            feature: "topP",
-            details: "topP is not supported for reasoning models"
-          });
-        }
-      }
-    } else {
-      if ((openaiOptions == null ? void 0 : openaiOptions.reasoningEffort) != null) {
-        warnings.push({
-          type: "unsupported",
-          feature: "reasoningEffort",
-          details: "reasoningEffort is not supported for non-reasoning models"
-        });
-      }
-      if ((openaiOptions == null ? void 0 : openaiOptions.reasoningSummary) != null) {
-        warnings.push({
-          type: "unsupported",
-          feature: "reasoningSummary",
-          details: "reasoningSummary is not supported for non-reasoning models"
-        });
-      }
-    }
-    if ((openaiOptions == null ? void 0 : openaiOptions.serviceTier) === "flex" && !modelCapabilities.supportsFlexProcessing) {
-      warnings.push({
-        type: "unsupported",
-        feature: "serviceTier",
-        details: "flex processing is only available for o3, o4-mini, and gpt-5 models"
-      });
-      delete baseArgs.service_tier;
-    }
-    if ((openaiOptions == null ? void 0 : openaiOptions.serviceTier) === "priority" && !modelCapabilities.supportsPriorityProcessing) {
-      warnings.push({
-        type: "unsupported",
-        feature: "serviceTier",
-        details: "priority processing is only available for supported models (gpt-4, gpt-5, gpt-5-mini, o3, o4-mini) and requires Enterprise access. gpt-5-nano is not supported"
-      });
-      delete baseArgs.service_tier;
-    }
-    const shellToolEnvType = (_i = (_h = (_g = tools == null ? void 0 : tools.find(
-      (tool2) => tool2.type === "provider" && tool2.id === "openai.shell"
-    )) == null ? void 0 : _g.args) == null ? void 0 : _h.environment) == null ? void 0 : _i.type;
-    const isShellProviderExecuted = shellToolEnvType === "containerAuto" || shellToolEnvType === "containerReference";
-    return {
-      webSearchToolName,
-      args: {
-        ...baseArgs,
-        tools: openaiTools2,
-        tool_choice: openaiToolChoice
-      },
-      warnings: [...warnings, ...toolWarnings],
-      store,
-      toolNameMapping,
-      providerOptionsName,
-      isShellProviderExecuted
-    };
-  }
-  async doGenerate(options) {
-    var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r2, _s, _t2, _u, _v, _w, _x, _y;
-    const {
-      args: body,
-      warnings,
-      webSearchToolName,
-      toolNameMapping,
-      providerOptionsName,
-      isShellProviderExecuted
-    } = await this.getArgs(options);
-    const url2 = this.config.url({
-      path: "/responses",
-      modelId: this.modelId
-    });
-    const approvalRequestIdToDummyToolCallIdFromPrompt = extractApprovalRequestIdToToolCallIdMapping(options.prompt);
-    const {
-      responseHeaders,
-      value: response,
-      rawValue: rawResponse
-    } = await postJsonToApi({
-      url: url2,
-      headers: combineHeaders(this.config.headers(), options.headers),
-      body,
-      failedResponseHandler: openaiFailedResponseHandler,
-      successfulResponseHandler: createJsonResponseHandler(
-        openaiResponsesResponseSchema
-      ),
-      abortSignal: options.abortSignal,
-      fetch: this.config.fetch
-    });
-    if (response.error) {
-      throw new APICallError({
-        message: response.error.message,
-        url: url2,
-        requestBodyValues: body,
-        statusCode: 400,
-        responseHeaders,
-        responseBody: rawResponse,
-        isRetryable: false
-      });
-    }
-    const content = [];
-    const logprobs = [];
-    let hasFunctionCall = false;
-    for (const part of response.output) {
-      switch (part.type) {
-        case "reasoning": {
-          if (part.summary.length === 0) {
-            part.summary.push({ type: "summary_text", text: "" });
-          }
-          for (const summary of part.summary) {
-            content.push({
-              type: "reasoning",
-              text: summary.text,
-              providerMetadata: {
-                [providerOptionsName]: {
-                  itemId: part.id,
-                  reasoningEncryptedContent: (_a21 = part.encrypted_content) != null ? _a21 : null
-                }
-              }
-            });
-          }
-          break;
-        }
-        case "image_generation_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("image_generation"),
-            input: "{}",
-            providerExecuted: true
-          });
-          content.push({
-            type: "tool-result",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("image_generation"),
-            result: {
-              result: part.result
-            }
-          });
-          break;
-        }
-        case "local_shell_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.call_id,
-            toolName: toolNameMapping.toCustomToolName("local_shell"),
-            input: JSON.stringify({
-              action: part.action
-            }),
-            providerMetadata: {
-              [providerOptionsName]: {
-                itemId: part.id
-              }
-            }
-          });
-          break;
-        }
-        case "shell_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.call_id,
-            toolName: toolNameMapping.toCustomToolName("shell"),
-            input: JSON.stringify({
-              action: {
-                commands: part.action.commands
-              }
-            }),
-            ...isShellProviderExecuted && { providerExecuted: true },
-            providerMetadata: {
-              [providerOptionsName]: {
-                itemId: part.id
-              }
-            }
-          });
-          break;
-        }
-        case "shell_call_output": {
-          content.push({
-            type: "tool-result",
-            toolCallId: part.call_id,
-            toolName: toolNameMapping.toCustomToolName("shell"),
-            result: {
-              output: part.output.map((item) => ({
-                stdout: item.stdout,
-                stderr: item.stderr,
-                outcome: item.outcome.type === "exit" ? {
-                  type: "exit",
-                  exitCode: item.outcome.exit_code
-                } : { type: "timeout" }
-              }))
-            }
-          });
-          break;
-        }
-        case "message": {
-          for (const contentPart of part.content) {
-            if (((_c = (_b17 = options.providerOptions) == null ? void 0 : _b17[providerOptionsName]) == null ? void 0 : _c.logprobs) && contentPart.logprobs) {
-              logprobs.push(contentPart.logprobs);
-            }
-            const providerMetadata2 = {
-              itemId: part.id,
-              ...part.phase != null && { phase: part.phase },
-              ...contentPart.annotations.length > 0 && {
-                annotations: contentPart.annotations
-              }
-            };
-            content.push({
-              type: "text",
-              text: contentPart.text,
-              providerMetadata: {
-                [providerOptionsName]: providerMetadata2
-              }
-            });
-            for (const annotation of contentPart.annotations) {
-              if (annotation.type === "url_citation") {
-                content.push({
-                  type: "source",
-                  sourceType: "url",
-                  id: (_f = (_e2 = (_d = this.config).generateId) == null ? void 0 : _e2.call(_d)) != null ? _f : generateId(),
-                  url: annotation.url,
-                  title: annotation.title
-                });
-              } else if (annotation.type === "file_citation") {
-                content.push({
-                  type: "source",
-                  sourceType: "document",
-                  id: (_i = (_h = (_g = this.config).generateId) == null ? void 0 : _h.call(_g)) != null ? _i : generateId(),
-                  mediaType: "text/plain",
-                  title: annotation.filename,
-                  filename: annotation.filename,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      type: annotation.type,
-                      fileId: annotation.file_id,
-                      index: annotation.index
-                    }
-                  }
-                });
-              } else if (annotation.type === "container_file_citation") {
-                content.push({
-                  type: "source",
-                  sourceType: "document",
-                  id: (_l = (_k = (_j = this.config).generateId) == null ? void 0 : _k.call(_j)) != null ? _l : generateId(),
-                  mediaType: "text/plain",
-                  title: annotation.filename,
-                  filename: annotation.filename,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      type: annotation.type,
-                      fileId: annotation.file_id,
-                      containerId: annotation.container_id
-                    }
-                  }
-                });
-              } else if (annotation.type === "file_path") {
-                content.push({
-                  type: "source",
-                  sourceType: "document",
-                  id: (_o = (_n = (_m = this.config).generateId) == null ? void 0 : _n.call(_m)) != null ? _o : generateId(),
-                  mediaType: "application/octet-stream",
-                  title: annotation.file_id,
-                  filename: annotation.file_id,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      type: annotation.type,
-                      fileId: annotation.file_id,
-                      index: annotation.index
-                    }
-                  }
-                });
-              }
-            }
-          }
-          break;
-        }
-        case "function_call": {
-          hasFunctionCall = true;
-          content.push({
-            type: "tool-call",
-            toolCallId: part.call_id,
-            toolName: part.name,
-            input: part.arguments,
-            providerMetadata: {
-              [providerOptionsName]: {
-                itemId: part.id
-              }
-            }
-          });
-          break;
-        }
-        case "custom_tool_call": {
-          hasFunctionCall = true;
-          const toolName = toolNameMapping.toCustomToolName(part.name);
-          content.push({
-            type: "tool-call",
-            toolCallId: part.call_id,
-            toolName,
-            input: JSON.stringify(part.input),
-            providerMetadata: {
-              [providerOptionsName]: {
-                itemId: part.id
-              }
-            }
-          });
-          break;
-        }
-        case "web_search_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName(
-              webSearchToolName != null ? webSearchToolName : "web_search"
-            ),
-            input: JSON.stringify({}),
-            providerExecuted: true
-          });
-          content.push({
-            type: "tool-result",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName(
-              webSearchToolName != null ? webSearchToolName : "web_search"
-            ),
-            result: mapWebSearchOutput(part.action)
-          });
-          break;
-        }
-        case "mcp_call": {
-          const toolCallId = part.approval_request_id != null ? (_p = approvalRequestIdToDummyToolCallIdFromPrompt[part.approval_request_id]) != null ? _p : part.id : part.id;
-          const toolName = `mcp.${part.name}`;
-          content.push({
-            type: "tool-call",
-            toolCallId,
-            toolName,
-            input: part.arguments,
-            providerExecuted: true,
-            dynamic: true
-          });
-          content.push({
-            type: "tool-result",
-            toolCallId,
-            toolName,
-            result: {
-              type: "call",
-              serverLabel: part.server_label,
-              name: part.name,
-              arguments: part.arguments,
-              ...part.output != null ? { output: part.output } : {},
-              ...part.error != null ? { error: part.error } : {}
-            },
-            providerMetadata: {
-              [providerOptionsName]: {
-                itemId: part.id
-              }
-            }
-          });
-          break;
-        }
-        case "mcp_list_tools": {
-          break;
-        }
-        case "mcp_approval_request": {
-          const approvalRequestId = (_q = part.approval_request_id) != null ? _q : part.id;
-          const dummyToolCallId = (_t2 = (_s = (_r2 = this.config).generateId) == null ? void 0 : _s.call(_r2)) != null ? _t2 : generateId();
-          const toolName = `mcp.${part.name}`;
-          content.push({
-            type: "tool-call",
-            toolCallId: dummyToolCallId,
-            toolName,
-            input: part.arguments,
-            providerExecuted: true,
-            dynamic: true
-          });
-          content.push({
-            type: "tool-approval-request",
-            approvalId: approvalRequestId,
-            toolCallId: dummyToolCallId
-          });
-          break;
-        }
-        case "computer_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("computer_use"),
-            input: "",
-            providerExecuted: true
-          });
-          content.push({
-            type: "tool-result",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("computer_use"),
-            result: {
-              type: "computer_use_tool_result",
-              status: part.status || "completed"
-            }
-          });
-          break;
-        }
-        case "file_search_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("file_search"),
-            input: "{}",
-            providerExecuted: true
-          });
-          content.push({
-            type: "tool-result",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("file_search"),
-            result: {
-              queries: part.queries,
-              results: (_v = (_u = part.results) == null ? void 0 : _u.map((result) => ({
-                attributes: result.attributes,
-                fileId: result.file_id,
-                filename: result.filename,
-                score: result.score,
-                text: result.text
-              }))) != null ? _v : null
-            }
-          });
-          break;
-        }
-        case "code_interpreter_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("code_interpreter"),
-            input: JSON.stringify({
-              code: part.code,
-              containerId: part.container_id
-            }),
-            providerExecuted: true
-          });
-          content.push({
-            type: "tool-result",
-            toolCallId: part.id,
-            toolName: toolNameMapping.toCustomToolName("code_interpreter"),
-            result: {
-              outputs: part.outputs
-            }
-          });
-          break;
-        }
-        case "apply_patch_call": {
-          content.push({
-            type: "tool-call",
-            toolCallId: part.call_id,
-            toolName: toolNameMapping.toCustomToolName("apply_patch"),
-            input: JSON.stringify({
-              callId: part.call_id,
-              operation: part.operation
-            }),
-            providerMetadata: {
-              [providerOptionsName]: {
-                itemId: part.id
-              }
-            }
-          });
-          break;
-        }
-      }
-    }
-    const providerMetadata = {
-      [providerOptionsName]: {
-        responseId: response.id,
-        ...logprobs.length > 0 ? { logprobs } : {},
-        ...typeof response.service_tier === "string" ? { serviceTier: response.service_tier } : {}
-      }
-    };
-    const usage = response.usage;
-    return {
-      content,
-      finishReason: {
-        unified: mapOpenAIResponseFinishReason({
-          finishReason: (_w = response.incomplete_details) == null ? void 0 : _w.reason,
-          hasFunctionCall
-        }),
-        raw: (_y = (_x = response.incomplete_details) == null ? void 0 : _x.reason) != null ? _y : void 0
-      },
-      usage: convertOpenAIResponsesUsage(usage),
-      request: { body },
-      response: {
-        id: response.id,
-        timestamp: new Date(response.created_at * 1e3),
-        modelId: response.model,
-        headers: responseHeaders,
-        body: rawResponse
-      },
-      providerMetadata,
-      warnings
-    };
-  }
-  async doStream(options) {
-    const {
-      args: body,
-      warnings,
-      webSearchToolName,
-      toolNameMapping,
-      store,
-      providerOptionsName,
-      isShellProviderExecuted
-    } = await this.getArgs(options);
-    const { responseHeaders, value: response } = await postJsonToApi({
-      url: this.config.url({
-        path: "/responses",
-        modelId: this.modelId
-      }),
-      headers: combineHeaders(this.config.headers(), options.headers),
-      body: {
-        ...body,
-        stream: true
-      },
-      failedResponseHandler: openaiFailedResponseHandler,
-      successfulResponseHandler: createEventSourceResponseHandler(
-        openaiResponsesChunkSchema
-      ),
-      abortSignal: options.abortSignal,
-      fetch: this.config.fetch
-    });
-    const self2 = this;
-    const approvalRequestIdToDummyToolCallIdFromPrompt = extractApprovalRequestIdToToolCallIdMapping(options.prompt);
-    const approvalRequestIdToDummyToolCallIdFromStream = /* @__PURE__ */ new Map();
-    let finishReason = {
-      unified: "other",
-      raw: void 0
-    };
-    let usage = void 0;
-    const logprobs = [];
-    let responseId = null;
-    const ongoingToolCalls = {};
-    const ongoingAnnotations = [];
-    let activeMessagePhase;
-    let hasFunctionCall = false;
-    const activeReasoning = {};
-    let serviceTier;
-    return {
-      stream: response.pipeThrough(
-        new TransformStream({
-          start(controller) {
-            controller.enqueue({ type: "stream-start", warnings });
-          },
-          transform(chunk, controller) {
-            var _a21, _b17, _c, _d, _e2, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r2, _s, _t2, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F;
-            if (options.includeRawChunks) {
-              controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
-            }
-            if (!chunk.success) {
-              finishReason = { unified: "error", raw: void 0 };
-              controller.enqueue({ type: "error", error: chunk.error });
-              return;
-            }
-            const value = chunk.value;
-            if (isResponseOutputItemAddedChunk(value)) {
-              if (value.item.type === "function_call") {
-                ongoingToolCalls[value.output_index] = {
-                  toolName: value.item.name,
-                  toolCallId: value.item.call_id
-                };
-                controller.enqueue({
-                  type: "tool-input-start",
-                  id: value.item.call_id,
-                  toolName: value.item.name
-                });
-              } else if (value.item.type === "custom_tool_call") {
-                const toolName = toolNameMapping.toCustomToolName(
-                  value.item.name
-                );
-                ongoingToolCalls[value.output_index] = {
-                  toolName,
-                  toolCallId: value.item.call_id
-                };
-                controller.enqueue({
-                  type: "tool-input-start",
-                  id: value.item.call_id,
-                  toolName
-                });
-              } else if (value.item.type === "web_search_call") {
-                ongoingToolCalls[value.output_index] = {
-                  toolName: toolNameMapping.toCustomToolName(
-                    webSearchToolName != null ? webSearchToolName : "web_search"
-                  ),
-                  toolCallId: value.item.id
-                };
-                controller.enqueue({
-                  type: "tool-input-start",
-                  id: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName(
-                    webSearchToolName != null ? webSearchToolName : "web_search"
-                  ),
-                  providerExecuted: true
-                });
-                controller.enqueue({
-                  type: "tool-input-end",
-                  id: value.item.id
-                });
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName(
-                    webSearchToolName != null ? webSearchToolName : "web_search"
-                  ),
-                  input: JSON.stringify({}),
-                  providerExecuted: true
-                });
-              } else if (value.item.type === "computer_call") {
-                ongoingToolCalls[value.output_index] = {
-                  toolName: toolNameMapping.toCustomToolName("computer_use"),
-                  toolCallId: value.item.id
-                };
-                controller.enqueue({
-                  type: "tool-input-start",
-                  id: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("computer_use"),
-                  providerExecuted: true
-                });
-              } else if (value.item.type === "code_interpreter_call") {
-                ongoingToolCalls[value.output_index] = {
-                  toolName: toolNameMapping.toCustomToolName("code_interpreter"),
-                  toolCallId: value.item.id,
-                  codeInterpreter: {
-                    containerId: value.item.container_id
-                  }
-                };
-                controller.enqueue({
-                  type: "tool-input-start",
-                  id: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("code_interpreter"),
-                  providerExecuted: true
-                });
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: value.item.id,
-                  delta: `{"containerId":"${value.item.container_id}","code":"`
-                });
-              } else if (value.item.type === "file_search_call") {
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("file_search"),
-                  input: "{}",
-                  providerExecuted: true
-                });
-              } else if (value.item.type === "image_generation_call") {
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("image_generation"),
-                  input: "{}",
-                  providerExecuted: true
-                });
-              } else if (value.item.type === "mcp_call" || value.item.type === "mcp_list_tools" || value.item.type === "mcp_approval_request") {
-              } else if (value.item.type === "apply_patch_call") {
-                const { call_id: callId, operation } = value.item;
-                ongoingToolCalls[value.output_index] = {
-                  toolName: toolNameMapping.toCustomToolName("apply_patch"),
-                  toolCallId: callId,
-                  applyPatch: {
-                    // delete_file doesn't have diff
-                    hasDiff: operation.type === "delete_file",
-                    endEmitted: operation.type === "delete_file"
-                  }
-                };
-                controller.enqueue({
-                  type: "tool-input-start",
-                  id: callId,
-                  toolName: toolNameMapping.toCustomToolName("apply_patch")
-                });
-                if (operation.type === "delete_file") {
-                  const inputString = JSON.stringify({
-                    callId,
-                    operation
-                  });
-                  controller.enqueue({
-                    type: "tool-input-delta",
-                    id: callId,
-                    delta: inputString
-                  });
-                  controller.enqueue({
-                    type: "tool-input-end",
-                    id: callId
-                  });
-                } else {
-                  controller.enqueue({
-                    type: "tool-input-delta",
-                    id: callId,
-                    delta: `{"callId":"${escapeJSONDelta(callId)}","operation":{"type":"${escapeJSONDelta(operation.type)}","path":"${escapeJSONDelta(operation.path)}","diff":"`
-                  });
-                }
-              } else if (value.item.type === "shell_call") {
-                ongoingToolCalls[value.output_index] = {
-                  toolName: toolNameMapping.toCustomToolName("shell"),
-                  toolCallId: value.item.call_id
-                };
-              } else if (value.item.type === "shell_call_output") {
-              } else if (value.item.type === "message") {
-                ongoingAnnotations.splice(0, ongoingAnnotations.length);
-                activeMessagePhase = (_a21 = value.item.phase) != null ? _a21 : void 0;
-                controller.enqueue({
-                  type: "text-start",
-                  id: value.item.id,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item.id,
-                      ...value.item.phase != null && {
-                        phase: value.item.phase
-                      }
-                    }
-                  }
-                });
-              } else if (isResponseOutputItemAddedChunk(value) && value.item.type === "reasoning") {
-                activeReasoning[value.item.id] = {
-                  encryptedContent: value.item.encrypted_content,
-                  summaryParts: { 0: "active" }
-                };
-                controller.enqueue({
-                  type: "reasoning-start",
-                  id: `${value.item.id}:0`,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item.id,
-                      reasoningEncryptedContent: (_b17 = value.item.encrypted_content) != null ? _b17 : null
-                    }
-                  }
-                });
-              }
-            } else if (isResponseOutputItemDoneChunk(value)) {
-              if (value.item.type === "message") {
-                const phase = (_c = value.item.phase) != null ? _c : activeMessagePhase;
-                activeMessagePhase = void 0;
-                controller.enqueue({
-                  type: "text-end",
-                  id: value.item.id,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item.id,
-                      ...phase != null && { phase },
-                      ...ongoingAnnotations.length > 0 && {
-                        annotations: ongoingAnnotations
-                      }
-                    }
-                  }
-                });
-              } else if (value.item.type === "function_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                hasFunctionCall = true;
-                controller.enqueue({
-                  type: "tool-input-end",
-                  id: value.item.call_id
-                });
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.call_id,
-                  toolName: value.item.name,
-                  input: value.item.arguments,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item.id
-                    }
-                  }
-                });
-              } else if (value.item.type === "custom_tool_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                hasFunctionCall = true;
-                const toolName = toolNameMapping.toCustomToolName(
-                  value.item.name
-                );
-                controller.enqueue({
-                  type: "tool-input-end",
-                  id: value.item.call_id
-                });
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.call_id,
-                  toolName,
-                  input: JSON.stringify(value.item.input),
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item.id
-                    }
-                  }
-                });
-              } else if (value.item.type === "web_search_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName(
-                    webSearchToolName != null ? webSearchToolName : "web_search"
-                  ),
-                  result: mapWebSearchOutput(value.item.action)
-                });
-              } else if (value.item.type === "computer_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                controller.enqueue({
-                  type: "tool-input-end",
-                  id: value.item.id
-                });
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("computer_use"),
-                  input: "",
-                  providerExecuted: true
-                });
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("computer_use"),
-                  result: {
-                    type: "computer_use_tool_result",
-                    status: value.item.status || "completed"
-                  }
-                });
-              } else if (value.item.type === "file_search_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("file_search"),
-                  result: {
-                    queries: value.item.queries,
-                    results: (_e2 = (_d = value.item.results) == null ? void 0 : _d.map((result) => ({
-                      attributes: result.attributes,
-                      fileId: result.file_id,
-                      filename: result.filename,
-                      score: result.score,
-                      text: result.text
-                    }))) != null ? _e2 : null
-                  }
-                });
-              } else if (value.item.type === "code_interpreter_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("code_interpreter"),
-                  result: {
-                    outputs: value.item.outputs
-                  }
-                });
-              } else if (value.item.type === "image_generation_call") {
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: value.item.id,
-                  toolName: toolNameMapping.toCustomToolName("image_generation"),
-                  result: {
-                    result: value.item.result
-                  }
-                });
-              } else if (value.item.type === "mcp_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                const approvalRequestId = (_f = value.item.approval_request_id) != null ? _f : void 0;
-                const aliasedToolCallId = approvalRequestId != null ? (_h = (_g = approvalRequestIdToDummyToolCallIdFromStream.get(
-                  approvalRequestId
-                )) != null ? _g : approvalRequestIdToDummyToolCallIdFromPrompt[approvalRequestId]) != null ? _h : value.item.id : value.item.id;
-                const toolName = `mcp.${value.item.name}`;
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: aliasedToolCallId,
-                  toolName,
-                  input: value.item.arguments,
-                  providerExecuted: true,
-                  dynamic: true
-                });
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: aliasedToolCallId,
-                  toolName,
-                  result: {
-                    type: "call",
-                    serverLabel: value.item.server_label,
-                    name: value.item.name,
-                    arguments: value.item.arguments,
-                    ...value.item.output != null ? { output: value.item.output } : {},
-                    ...value.item.error != null ? { error: value.item.error } : {}
-                  },
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item.id
-                    }
-                  }
-                });
-              } else if (value.item.type === "mcp_list_tools") {
-                ongoingToolCalls[value.output_index] = void 0;
-              } else if (value.item.type === "apply_patch_call") {
-                const toolCall = ongoingToolCalls[value.output_index];
-                if ((toolCall == null ? void 0 : toolCall.applyPatch) && !toolCall.applyPatch.endEmitted && value.item.operation.type !== "delete_file") {
-                  if (!toolCall.applyPatch.hasDiff) {
-                    controller.enqueue({
-                      type: "tool-input-delta",
-                      id: toolCall.toolCallId,
-                      delta: escapeJSONDelta(value.item.operation.diff)
-                    });
-                  }
-                  controller.enqueue({
-                    type: "tool-input-delta",
-                    id: toolCall.toolCallId,
-                    delta: '"}}'
-                  });
-                  controller.enqueue({
-                    type: "tool-input-end",
-                    id: toolCall.toolCallId
-                  });
-                  toolCall.applyPatch.endEmitted = true;
-                }
-                if (toolCall && value.item.status === "completed") {
-                  controller.enqueue({
-                    type: "tool-call",
-                    toolCallId: toolCall.toolCallId,
-                    toolName: toolNameMapping.toCustomToolName("apply_patch"),
-                    input: JSON.stringify({
-                      callId: value.item.call_id,
-                      operation: value.item.operation
-                    }),
-                    providerMetadata: {
-                      [providerOptionsName]: {
-                        itemId: value.item.id
-                      }
-                    }
-                  });
-                }
-                ongoingToolCalls[value.output_index] = void 0;
-              } else if (value.item.type === "mcp_approval_request") {
-                ongoingToolCalls[value.output_index] = void 0;
-                const dummyToolCallId = (_k = (_j = (_i = self2.config).generateId) == null ? void 0 : _j.call(_i)) != null ? _k : generateId();
-                const approvalRequestId = (_l = value.item.approval_request_id) != null ? _l : value.item.id;
-                approvalRequestIdToDummyToolCallIdFromStream.set(
-                  approvalRequestId,
-                  dummyToolCallId
-                );
-                const toolName = `mcp.${value.item.name}`;
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: dummyToolCallId,
-                  toolName,
-                  input: value.item.arguments,
-                  providerExecuted: true,
-                  dynamic: true
-                });
-                controller.enqueue({
-                  type: "tool-approval-request",
-                  approvalId: approvalRequestId,
-                  toolCallId: dummyToolCallId
-                });
-              } else if (value.item.type === "local_shell_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.call_id,
-                  toolName: toolNameMapping.toCustomToolName("local_shell"),
-                  input: JSON.stringify({
-                    action: {
-                      type: "exec",
-                      command: value.item.action.command,
-                      timeoutMs: value.item.action.timeout_ms,
-                      user: value.item.action.user,
-                      workingDirectory: value.item.action.working_directory,
-                      env: value.item.action.env
-                    }
-                  }),
-                  providerMetadata: {
-                    [providerOptionsName]: { itemId: value.item.id }
-                  }
-                });
-              } else if (value.item.type === "shell_call") {
-                ongoingToolCalls[value.output_index] = void 0;
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: value.item.call_id,
-                  toolName: toolNameMapping.toCustomToolName("shell"),
-                  input: JSON.stringify({
-                    action: {
-                      commands: value.item.action.commands
-                    }
-                  }),
-                  ...isShellProviderExecuted && {
-                    providerExecuted: true
-                  },
-                  providerMetadata: {
-                    [providerOptionsName]: { itemId: value.item.id }
-                  }
-                });
-              } else if (value.item.type === "shell_call_output") {
-                controller.enqueue({
-                  type: "tool-result",
-                  toolCallId: value.item.call_id,
-                  toolName: toolNameMapping.toCustomToolName("shell"),
-                  result: {
-                    output: value.item.output.map(
-                      (item) => ({
-                        stdout: item.stdout,
-                        stderr: item.stderr,
-                        outcome: item.outcome.type === "exit" ? {
-                          type: "exit",
-                          exitCode: item.outcome.exit_code
-                        } : { type: "timeout" }
-                      })
-                    )
-                  }
-                });
-              } else if (value.item.type === "reasoning") {
-                const activeReasoningPart = activeReasoning[value.item.id];
-                const summaryPartIndices = Object.entries(
-                  activeReasoningPart.summaryParts
-                ).filter(
-                  ([_2, status]) => status === "active" || status === "can-conclude"
-                ).map(([summaryIndex]) => summaryIndex);
-                for (const summaryIndex of summaryPartIndices) {
-                  controller.enqueue({
-                    type: "reasoning-end",
-                    id: `${value.item.id}:${summaryIndex}`,
-                    providerMetadata: {
-                      [providerOptionsName]: {
-                        itemId: value.item.id,
-                        reasoningEncryptedContent: (_m = value.item.encrypted_content) != null ? _m : null
-                      }
-                    }
-                  });
-                }
-                delete activeReasoning[value.item.id];
-              }
-            } else if (isResponseFunctionCallArgumentsDeltaChunk(value)) {
-              const toolCall = ongoingToolCalls[value.output_index];
-              if (toolCall != null) {
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: toolCall.toolCallId,
-                  delta: value.delta
-                });
-              }
-            } else if (isResponseCustomToolCallInputDeltaChunk(value)) {
-              const toolCall = ongoingToolCalls[value.output_index];
-              if (toolCall != null) {
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: toolCall.toolCallId,
-                  delta: value.delta
-                });
-              }
-            } else if (isResponseApplyPatchCallOperationDiffDeltaChunk(value)) {
-              const toolCall = ongoingToolCalls[value.output_index];
-              if (toolCall == null ? void 0 : toolCall.applyPatch) {
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: toolCall.toolCallId,
-                  delta: escapeJSONDelta(value.delta)
-                });
-                toolCall.applyPatch.hasDiff = true;
-              }
-            } else if (isResponseApplyPatchCallOperationDiffDoneChunk(value)) {
-              const toolCall = ongoingToolCalls[value.output_index];
-              if ((toolCall == null ? void 0 : toolCall.applyPatch) && !toolCall.applyPatch.endEmitted) {
-                if (!toolCall.applyPatch.hasDiff) {
-                  controller.enqueue({
-                    type: "tool-input-delta",
-                    id: toolCall.toolCallId,
-                    delta: escapeJSONDelta(value.diff)
-                  });
-                  toolCall.applyPatch.hasDiff = true;
-                }
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: toolCall.toolCallId,
-                  delta: '"}}'
-                });
-                controller.enqueue({
-                  type: "tool-input-end",
-                  id: toolCall.toolCallId
-                });
-                toolCall.applyPatch.endEmitted = true;
-              }
-            } else if (isResponseImageGenerationCallPartialImageChunk(value)) {
-              controller.enqueue({
-                type: "tool-result",
-                toolCallId: value.item_id,
-                toolName: toolNameMapping.toCustomToolName("image_generation"),
-                result: {
-                  result: value.partial_image_b64
-                },
-                preliminary: true
-              });
-            } else if (isResponseCodeInterpreterCallCodeDeltaChunk(value)) {
-              const toolCall = ongoingToolCalls[value.output_index];
-              if (toolCall != null) {
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: toolCall.toolCallId,
-                  delta: escapeJSONDelta(value.delta)
-                });
-              }
-            } else if (isResponseCodeInterpreterCallCodeDoneChunk(value)) {
-              const toolCall = ongoingToolCalls[value.output_index];
-              if (toolCall != null) {
-                controller.enqueue({
-                  type: "tool-input-delta",
-                  id: toolCall.toolCallId,
-                  delta: '"}'
-                });
-                controller.enqueue({
-                  type: "tool-input-end",
-                  id: toolCall.toolCallId
-                });
-                controller.enqueue({
-                  type: "tool-call",
-                  toolCallId: toolCall.toolCallId,
-                  toolName: toolNameMapping.toCustomToolName("code_interpreter"),
-                  input: JSON.stringify({
-                    code: value.code,
-                    containerId: toolCall.codeInterpreter.containerId
-                  }),
-                  providerExecuted: true
-                });
-              }
-            } else if (isResponseCreatedChunk(value)) {
-              responseId = value.response.id;
-              controller.enqueue({
-                type: "response-metadata",
-                id: value.response.id,
-                timestamp: new Date(value.response.created_at * 1e3),
-                modelId: value.response.model
-              });
-            } else if (isTextDeltaChunk(value)) {
-              controller.enqueue({
-                type: "text-delta",
-                id: value.item_id,
-                delta: value.delta
-              });
-              if (((_o = (_n = options.providerOptions) == null ? void 0 : _n[providerOptionsName]) == null ? void 0 : _o.logprobs) && value.logprobs) {
-                logprobs.push(value.logprobs);
-              }
-            } else if (value.type === "response.reasoning_summary_part.added") {
-              if (value.summary_index > 0) {
-                const activeReasoningPart = activeReasoning[value.item_id];
-                activeReasoningPart.summaryParts[value.summary_index] = "active";
-                for (const summaryIndex of Object.keys(
-                  activeReasoningPart.summaryParts
-                )) {
-                  if (activeReasoningPart.summaryParts[summaryIndex] === "can-conclude") {
-                    controller.enqueue({
-                      type: "reasoning-end",
-                      id: `${value.item_id}:${summaryIndex}`,
-                      providerMetadata: {
-                        [providerOptionsName]: {
-                          itemId: value.item_id
-                        }
-                      }
-                    });
-                    activeReasoningPart.summaryParts[summaryIndex] = "concluded";
-                  }
-                }
-                controller.enqueue({
-                  type: "reasoning-start",
-                  id: `${value.item_id}:${value.summary_index}`,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item_id,
-                      reasoningEncryptedContent: (_q = (_p = activeReasoning[value.item_id]) == null ? void 0 : _p.encryptedContent) != null ? _q : null
-                    }
-                  }
-                });
-              }
-            } else if (value.type === "response.reasoning_summary_text.delta") {
-              controller.enqueue({
-                type: "reasoning-delta",
-                id: `${value.item_id}:${value.summary_index}`,
-                delta: value.delta,
-                providerMetadata: {
-                  [providerOptionsName]: {
-                    itemId: value.item_id
-                  }
-                }
-              });
-            } else if (value.type === "response.reasoning_summary_part.done") {
-              if (store) {
-                controller.enqueue({
-                  type: "reasoning-end",
-                  id: `${value.item_id}:${value.summary_index}`,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      itemId: value.item_id
-                    }
-                  }
-                });
-                activeReasoning[value.item_id].summaryParts[value.summary_index] = "concluded";
-              } else {
-                activeReasoning[value.item_id].summaryParts[value.summary_index] = "can-conclude";
-              }
-            } else if (isResponseFinishedChunk(value)) {
-              finishReason = {
-                unified: mapOpenAIResponseFinishReason({
-                  finishReason: (_r2 = value.response.incomplete_details) == null ? void 0 : _r2.reason,
-                  hasFunctionCall
-                }),
-                raw: (_t2 = (_s = value.response.incomplete_details) == null ? void 0 : _s.reason) != null ? _t2 : void 0
-              };
-              usage = value.response.usage;
-              if (typeof value.response.service_tier === "string") {
-                serviceTier = value.response.service_tier;
-              }
-            } else if (isResponseAnnotationAddedChunk(value)) {
-              ongoingAnnotations.push(value.annotation);
-              if (value.annotation.type === "url_citation") {
-                controller.enqueue({
-                  type: "source",
-                  sourceType: "url",
-                  id: (_w = (_v = (_u = self2.config).generateId) == null ? void 0 : _v.call(_u)) != null ? _w : generateId(),
-                  url: value.annotation.url,
-                  title: value.annotation.title
-                });
-              } else if (value.annotation.type === "file_citation") {
-                controller.enqueue({
-                  type: "source",
-                  sourceType: "document",
-                  id: (_z = (_y = (_x = self2.config).generateId) == null ? void 0 : _y.call(_x)) != null ? _z : generateId(),
-                  mediaType: "text/plain",
-                  title: value.annotation.filename,
-                  filename: value.annotation.filename,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      type: value.annotation.type,
-                      fileId: value.annotation.file_id,
-                      index: value.annotation.index
-                    }
-                  }
-                });
-              } else if (value.annotation.type === "container_file_citation") {
-                controller.enqueue({
-                  type: "source",
-                  sourceType: "document",
-                  id: (_C = (_B = (_A = self2.config).generateId) == null ? void 0 : _B.call(_A)) != null ? _C : generateId(),
-                  mediaType: "text/plain",
-                  title: value.annotation.filename,
-                  filename: value.annotation.filename,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      type: value.annotation.type,
-                      fileId: value.annotation.file_id,
-                      containerId: value.annotation.container_id
-                    }
-                  }
-                });
-              } else if (value.annotation.type === "file_path") {
-                controller.enqueue({
-                  type: "source",
-                  sourceType: "document",
-                  id: (_F = (_E = (_D = self2.config).generateId) == null ? void 0 : _E.call(_D)) != null ? _F : generateId(),
-                  mediaType: "application/octet-stream",
-                  title: value.annotation.file_id,
-                  filename: value.annotation.file_id,
-                  providerMetadata: {
-                    [providerOptionsName]: {
-                      type: value.annotation.type,
-                      fileId: value.annotation.file_id,
-                      index: value.annotation.index
-                    }
-                  }
-                });
-              }
-            } else if (isErrorChunk(value)) {
-              controller.enqueue({ type: "error", error: value });
-            }
-          },
-          flush(controller) {
-            const providerMetadata = {
-              [providerOptionsName]: {
-                responseId,
-                ...logprobs.length > 0 ? { logprobs } : {},
-                ...serviceTier !== void 0 ? { serviceTier } : {}
-              }
-            };
-            controller.enqueue({
-              type: "finish",
-              finishReason,
-              usage: convertOpenAIResponsesUsage(usage),
-              providerMetadata
-            });
-          }
-        })
-      ),
-      request: { body },
-      response: { headers: responseHeaders }
-    };
-  }
-};
-function isTextDeltaChunk(chunk) {
-  return chunk.type === "response.output_text.delta";
-}
-__name(isTextDeltaChunk, "isTextDeltaChunk");
-function isResponseOutputItemDoneChunk(chunk) {
-  return chunk.type === "response.output_item.done";
-}
-__name(isResponseOutputItemDoneChunk, "isResponseOutputItemDoneChunk");
-function isResponseFinishedChunk(chunk) {
-  return chunk.type === "response.completed" || chunk.type === "response.incomplete";
-}
-__name(isResponseFinishedChunk, "isResponseFinishedChunk");
-function isResponseCreatedChunk(chunk) {
-  return chunk.type === "response.created";
-}
-__name(isResponseCreatedChunk, "isResponseCreatedChunk");
-function isResponseFunctionCallArgumentsDeltaChunk(chunk) {
-  return chunk.type === "response.function_call_arguments.delta";
-}
-__name(isResponseFunctionCallArgumentsDeltaChunk, "isResponseFunctionCallArgumentsDeltaChunk");
-function isResponseCustomToolCallInputDeltaChunk(chunk) {
-  return chunk.type === "response.custom_tool_call_input.delta";
-}
-__name(isResponseCustomToolCallInputDeltaChunk, "isResponseCustomToolCallInputDeltaChunk");
-function isResponseImageGenerationCallPartialImageChunk(chunk) {
-  return chunk.type === "response.image_generation_call.partial_image";
-}
-__name(isResponseImageGenerationCallPartialImageChunk, "isResponseImageGenerationCallPartialImageChunk");
-function isResponseCodeInterpreterCallCodeDeltaChunk(chunk) {
-  return chunk.type === "response.code_interpreter_call_code.delta";
-}
-__name(isResponseCodeInterpreterCallCodeDeltaChunk, "isResponseCodeInterpreterCallCodeDeltaChunk");
-function isResponseCodeInterpreterCallCodeDoneChunk(chunk) {
-  return chunk.type === "response.code_interpreter_call_code.done";
-}
-__name(isResponseCodeInterpreterCallCodeDoneChunk, "isResponseCodeInterpreterCallCodeDoneChunk");
-function isResponseApplyPatchCallOperationDiffDeltaChunk(chunk) {
-  return chunk.type === "response.apply_patch_call_operation_diff.delta";
-}
-__name(isResponseApplyPatchCallOperationDiffDeltaChunk, "isResponseApplyPatchCallOperationDiffDeltaChunk");
-function isResponseApplyPatchCallOperationDiffDoneChunk(chunk) {
-  return chunk.type === "response.apply_patch_call_operation_diff.done";
-}
-__name(isResponseApplyPatchCallOperationDiffDoneChunk, "isResponseApplyPatchCallOperationDiffDoneChunk");
-function isResponseOutputItemAddedChunk(chunk) {
-  return chunk.type === "response.output_item.added";
-}
-__name(isResponseOutputItemAddedChunk, "isResponseOutputItemAddedChunk");
-function isResponseAnnotationAddedChunk(chunk) {
-  return chunk.type === "response.output_text.annotation.added";
-}
-__name(isResponseAnnotationAddedChunk, "isResponseAnnotationAddedChunk");
-function isErrorChunk(chunk) {
-  return chunk.type === "error";
-}
-__name(isErrorChunk, "isErrorChunk");
-function mapWebSearchOutput(action) {
-  var _a21;
-  if (action == null) {
-    return {};
-  }
-  switch (action.type) {
-    case "search":
-      return {
-        action: { type: "search", query: (_a21 = action.query) != null ? _a21 : void 0 },
-        // include sources when provided by the Responses API (behind include flag)
-        ...action.sources != null && { sources: action.sources }
-      };
-    case "open_page":
-      return { action: { type: "openPage", url: action.url } };
-    case "find_in_page":
-      return {
-        action: {
-          type: "findInPage",
-          url: action.url,
-          pattern: action.pattern
-        }
-      };
-  }
-}
-__name(mapWebSearchOutput, "mapWebSearchOutput");
-function escapeJSONDelta(delta) {
-  return JSON.stringify(delta).slice(1, -1);
-}
-__name(escapeJSONDelta, "escapeJSONDelta");
-var openaiSpeechModelOptionsSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      instructions: external_exports.string().nullish(),
-      speed: external_exports.number().min(0.25).max(4).default(1).nullish()
-    })
-  )
-);
-var OpenAISpeechModel = class {
-  static {
-    __name(this, "OpenAISpeechModel");
-  }
-  constructor(modelId, config2) {
-    this.modelId = modelId;
-    this.config = config2;
-    this.specificationVersion = "v3";
-  }
-  get provider() {
-    return this.config.provider;
-  }
-  async getArgs({
-    text: text2,
-    voice = "alloy",
-    outputFormat = "mp3",
-    speed,
-    instructions,
-    language,
-    providerOptions
-  }) {
-    const warnings = [];
-    const openAIOptions = await parseProviderOptions({
-      provider: "openai",
-      providerOptions,
-      schema: openaiSpeechModelOptionsSchema
-    });
-    const requestBody = {
-      model: this.modelId,
-      input: text2,
-      voice,
-      response_format: "mp3",
-      speed,
-      instructions
-    };
-    if (outputFormat) {
-      if (["mp3", "opus", "aac", "flac", "wav", "pcm"].includes(outputFormat)) {
-        requestBody.response_format = outputFormat;
-      } else {
-        warnings.push({
-          type: "unsupported",
-          feature: "outputFormat",
-          details: `Unsupported output format: ${outputFormat}. Using mp3 instead.`
-        });
-      }
-    }
-    if (openAIOptions) {
-      const speechModelOptions = {};
-      for (const key in speechModelOptions) {
-        const value = speechModelOptions[key];
-        if (value !== void 0) {
-          requestBody[key] = value;
-        }
-      }
-    }
-    if (language) {
-      warnings.push({
-        type: "unsupported",
-        feature: "language",
-        details: `OpenAI speech models do not support language selection. Language parameter "${language}" was ignored.`
-      });
-    }
-    return {
-      requestBody,
-      warnings
-    };
-  }
-  async doGenerate(options) {
-    var _a21, _b17, _c;
-    const currentDate = (_c = (_b17 = (_a21 = this.config._internal) == null ? void 0 : _a21.currentDate) == null ? void 0 : _b17.call(_a21)) != null ? _c : /* @__PURE__ */ new Date();
-    const { requestBody, warnings } = await this.getArgs(options);
-    const {
-      value: audio,
-      responseHeaders,
-      rawValue: rawResponse
-    } = await postJsonToApi({
-      url: this.config.url({
-        path: "/audio/speech",
-        modelId: this.modelId
-      }),
-      headers: combineHeaders(this.config.headers(), options.headers),
-      body: requestBody,
-      failedResponseHandler: openaiFailedResponseHandler,
-      successfulResponseHandler: createBinaryResponseHandler(),
-      abortSignal: options.abortSignal,
-      fetch: this.config.fetch
-    });
-    return {
-      audio,
-      warnings,
-      request: {
-        body: JSON.stringify(requestBody)
-      },
-      response: {
-        timestamp: currentDate,
-        modelId: this.modelId,
-        headers: responseHeaders,
-        body: rawResponse
-      }
-    };
-  }
-};
-var openaiTranscriptionResponseSchema = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      text: external_exports.string(),
-      language: external_exports.string().nullish(),
-      duration: external_exports.number().nullish(),
-      words: external_exports.array(
-        external_exports.object({
-          word: external_exports.string(),
-          start: external_exports.number(),
-          end: external_exports.number()
-        })
-      ).nullish(),
-      segments: external_exports.array(
-        external_exports.object({
-          id: external_exports.number(),
-          seek: external_exports.number(),
-          start: external_exports.number(),
-          end: external_exports.number(),
-          text: external_exports.string(),
-          tokens: external_exports.array(external_exports.number()),
-          temperature: external_exports.number(),
-          avg_logprob: external_exports.number(),
-          compression_ratio: external_exports.number(),
-          no_speech_prob: external_exports.number()
-        })
-      ).nullish()
-    })
-  )
-);
-var openAITranscriptionModelOptions = lazySchema(
-  () => zodSchema(
-    external_exports.object({
-      /**
-       * Additional information to include in the transcription response.
-       */
-      include: external_exports.array(external_exports.string()).optional(),
-      /**
-       * The language of the input audio in ISO-639-1 format.
-       */
-      language: external_exports.string().optional(),
-      /**
-       * An optional text to guide the model's style or continue a previous audio segment.
-       */
-      prompt: external_exports.string().optional(),
-      /**
-       * The sampling temperature, between 0 and 1.
-       * @default 0
-       */
-      temperature: external_exports.number().min(0).max(1).default(0).optional(),
-      /**
-       * The timestamp granularities to populate for this transcription.
-       * @default ['segment']
-       */
-      timestampGranularities: external_exports.array(external_exports.enum(["word", "segment"])).default(["segment"]).optional()
-    })
-  )
-);
-var languageMap = {
-  afrikaans: "af",
-  arabic: "ar",
-  armenian: "hy",
-  azerbaijani: "az",
-  belarusian: "be",
-  bosnian: "bs",
-  bulgarian: "bg",
-  catalan: "ca",
-  chinese: "zh",
-  croatian: "hr",
-  czech: "cs",
-  danish: "da",
-  dutch: "nl",
-  english: "en",
-  estonian: "et",
-  finnish: "fi",
-  french: "fr",
-  galician: "gl",
-  german: "de",
-  greek: "el",
-  hebrew: "he",
-  hindi: "hi",
-  hungarian: "hu",
-  icelandic: "is",
-  indonesian: "id",
-  italian: "it",
-  japanese: "ja",
-  kannada: "kn",
-  kazakh: "kk",
-  korean: "ko",
-  latvian: "lv",
-  lithuanian: "lt",
-  macedonian: "mk",
-  malay: "ms",
-  marathi: "mr",
-  maori: "mi",
-  nepali: "ne",
-  norwegian: "no",
-  persian: "fa",
-  polish: "pl",
-  portuguese: "pt",
-  romanian: "ro",
-  russian: "ru",
-  serbian: "sr",
-  slovak: "sk",
-  slovenian: "sl",
-  spanish: "es",
-  swahili: "sw",
-  swedish: "sv",
-  tagalog: "tl",
-  tamil: "ta",
-  thai: "th",
-  turkish: "tr",
-  ukrainian: "uk",
-  urdu: "ur",
-  vietnamese: "vi",
-  welsh: "cy"
-};
-var OpenAITranscriptionModel = class {
-  static {
-    __name(this, "OpenAITranscriptionModel");
-  }
-  constructor(modelId, config2) {
-    this.modelId = modelId;
-    this.config = config2;
-    this.specificationVersion = "v3";
-  }
-  get provider() {
-    return this.config.provider;
-  }
-  async getArgs({
-    audio,
-    mediaType,
-    providerOptions
-  }) {
-    const warnings = [];
-    const openAIOptions = await parseProviderOptions({
-      provider: "openai",
-      providerOptions,
-      schema: openAITranscriptionModelOptions
-    });
-    const formData = new FormData();
-    const blob = audio instanceof Uint8Array ? new Blob([audio]) : new Blob([convertBase64ToUint8Array(audio)]);
-    formData.append("model", this.modelId);
-    const fileExtension = mediaTypeToExtension(mediaType);
-    formData.append(
-      "file",
-      new File([blob], "audio", { type: mediaType }),
-      `audio.${fileExtension}`
-    );
-    if (openAIOptions) {
-      const transcriptionModelOptions = {
-        include: openAIOptions.include,
-        language: openAIOptions.language,
-        prompt: openAIOptions.prompt,
-        // https://platform.openai.com/docs/api-reference/audio/createTranscription#audio_createtranscription-response_format
-        // prefer verbose_json to get segments for models that support it
-        response_format: [
-          "gpt-4o-transcribe",
-          "gpt-4o-mini-transcribe"
-        ].includes(this.modelId) ? "json" : "verbose_json",
-        temperature: openAIOptions.temperature,
-        timestamp_granularities: openAIOptions.timestampGranularities
-      };
-      for (const [key, value] of Object.entries(transcriptionModelOptions)) {
-        if (value != null) {
-          if (Array.isArray(value)) {
-            for (const item of value) {
-              formData.append(`${key}[]`, String(item));
-            }
-          } else {
-            formData.append(key, String(value));
-          }
-        }
-      }
-    }
-    return {
-      formData,
-      warnings
-    };
-  }
-  async doGenerate(options) {
-    var _a21, _b17, _c, _d, _e2, _f, _g, _h;
-    const currentDate = (_c = (_b17 = (_a21 = this.config._internal) == null ? void 0 : _a21.currentDate) == null ? void 0 : _b17.call(_a21)) != null ? _c : /* @__PURE__ */ new Date();
-    const { formData, warnings } = await this.getArgs(options);
-    const {
-      value: response,
-      responseHeaders,
-      rawValue: rawResponse
-    } = await postFormDataToApi({
-      url: this.config.url({
-        path: "/audio/transcriptions",
-        modelId: this.modelId
-      }),
-      headers: combineHeaders(this.config.headers(), options.headers),
-      formData,
-      failedResponseHandler: openaiFailedResponseHandler,
-      successfulResponseHandler: createJsonResponseHandler(
-        openaiTranscriptionResponseSchema
-      ),
-      abortSignal: options.abortSignal,
-      fetch: this.config.fetch
-    });
-    const language = response.language != null && response.language in languageMap ? languageMap[response.language] : void 0;
-    return {
-      text: response.text,
-      segments: (_g = (_f = (_d = response.segments) == null ? void 0 : _d.map((segment) => ({
-        text: segment.text,
-        startSecond: segment.start,
-        endSecond: segment.end
-      }))) != null ? _f : (_e2 = response.words) == null ? void 0 : _e2.map((word) => ({
-        text: word.word,
-        startSecond: word.start,
-        endSecond: word.end
-      }))) != null ? _g : [],
-      language,
-      durationInSeconds: (_h = response.duration) != null ? _h : void 0,
-      warnings,
-      response: {
-        timestamp: currentDate,
-        modelId: this.modelId,
-        headers: responseHeaders,
-        body: rawResponse
-      }
-    };
-  }
-};
-var VERSION4 = true ? "3.0.41" : "0.0.0-test";
-function createOpenAI(options = {}) {
-  var _a21, _b17;
-  const baseURL = (_a21 = withoutTrailingSlash(
-    loadOptionalSetting({
-      settingValue: options.baseURL,
-      environmentVariableName: "OPENAI_BASE_URL"
-    })
-  )) != null ? _a21 : "https://api.openai.com/v1";
-  const providerName = (_b17 = options.name) != null ? _b17 : "openai";
-  const getHeaders = /* @__PURE__ */ __name(() => withUserAgentSuffix(
-    {
-      Authorization: `Bearer ${loadApiKey({
-        apiKey: options.apiKey,
-        environmentVariableName: "OPENAI_API_KEY",
-        description: "OpenAI"
-      })}`,
-      "OpenAI-Organization": options.organization,
-      "OpenAI-Project": options.project,
-      ...options.headers
-    },
-    `ai-sdk/openai/${VERSION4}`
-  ), "getHeaders");
-  const createChatModel = /* @__PURE__ */ __name((modelId) => new OpenAIChatLanguageModel(modelId, {
-    provider: `${providerName}.chat`,
-    url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
+      return url2.toString();
+    }, "url"),
     headers: getHeaders,
     fetch: options.fetch
+  }), "getCommonModelConfig");
+  const createLanguageModel = /* @__PURE__ */ __name((modelId) => createChatModel(modelId), "createLanguageModel");
+  const createChatModel = /* @__PURE__ */ __name((modelId) => new OpenAICompatibleChatLanguageModel(modelId, {
+    ...getCommonModelConfig("chat"),
+    includeUsage: options.includeUsage,
+    supportsStructuredOutputs: options.supportsStructuredOutputs,
+    transformRequestBody: options.transformRequestBody,
+    metadataExtractor: options.metadataExtractor
   }), "createChatModel");
-  const createCompletionModel = /* @__PURE__ */ __name((modelId) => new OpenAICompletionLanguageModel(modelId, {
-    provider: `${providerName}.completion`,
-    url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
-    headers: getHeaders,
-    fetch: options.fetch
+  const createCompletionModel = /* @__PURE__ */ __name((modelId) => new OpenAICompatibleCompletionLanguageModel(modelId, {
+    ...getCommonModelConfig("completion"),
+    includeUsage: options.includeUsage
   }), "createCompletionModel");
-  const createEmbeddingModel = /* @__PURE__ */ __name((modelId) => new OpenAIEmbeddingModel(modelId, {
-    provider: `${providerName}.embedding`,
-    url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
-    headers: getHeaders,
-    fetch: options.fetch
+  const createEmbeddingModel = /* @__PURE__ */ __name((modelId) => new OpenAICompatibleEmbeddingModel(modelId, {
+    ...getCommonModelConfig("embedding")
   }), "createEmbeddingModel");
-  const createImageModel = /* @__PURE__ */ __name((modelId) => new OpenAIImageModel(modelId, {
-    provider: `${providerName}.image`,
-    url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
-    headers: getHeaders,
-    fetch: options.fetch
-  }), "createImageModel");
-  const createTranscriptionModel = /* @__PURE__ */ __name((modelId) => new OpenAITranscriptionModel(modelId, {
-    provider: `${providerName}.transcription`,
-    url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
-    headers: getHeaders,
-    fetch: options.fetch
-  }), "createTranscriptionModel");
-  const createSpeechModel = /* @__PURE__ */ __name((modelId) => new OpenAISpeechModel(modelId, {
-    provider: `${providerName}.speech`,
-    url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
-    headers: getHeaders,
-    fetch: options.fetch
-  }), "createSpeechModel");
-  const createLanguageModel = /* @__PURE__ */ __name((modelId) => {
-    if (new.target) {
-      throw new Error(
-        "The OpenAI model function cannot be called with the new keyword."
-      );
-    }
-    return createResponsesModel(modelId);
-  }, "createLanguageModel");
-  const createResponsesModel = /* @__PURE__ */ __name((modelId) => {
-    return new OpenAIResponsesLanguageModel(modelId, {
-      provider: `${providerName}.responses`,
-      url: /* @__PURE__ */ __name(({ path }) => `${baseURL}${path}`, "url"),
-      headers: getHeaders,
-      fetch: options.fetch,
-      fileIdPrefixes: ["file-"]
-    });
-  }, "createResponsesModel");
-  const provider = /* @__PURE__ */ __name(function(modelId) {
-    return createLanguageModel(modelId);
-  }, "provider");
+  const createImageModel = /* @__PURE__ */ __name((modelId) => new OpenAICompatibleImageModel(modelId, getCommonModelConfig("image")), "createImageModel");
+  const provider = /* @__PURE__ */ __name((modelId) => createLanguageModel(modelId), "provider");
   provider.specificationVersion = "v3";
   provider.languageModel = createLanguageModel;
-  provider.chat = createChatModel;
-  provider.completion = createCompletionModel;
-  provider.responses = createResponsesModel;
-  provider.embedding = createEmbeddingModel;
+  provider.chatModel = createChatModel;
+  provider.completionModel = createCompletionModel;
   provider.embeddingModel = createEmbeddingModel;
-  provider.textEmbedding = createEmbeddingModel;
   provider.textEmbeddingModel = createEmbeddingModel;
-  provider.image = createImageModel;
   provider.imageModel = createImageModel;
-  provider.transcription = createTranscriptionModel;
-  provider.transcriptionModel = createTranscriptionModel;
-  provider.speech = createSpeechModel;
-  provider.speechModel = createSpeechModel;
-  provider.tools = openaiTools;
   return provider;
 }
-__name(createOpenAI, "createOpenAI");
-var openai = createOpenAI();
+__name(createOpenAICompatible, "createOpenAICompatible");
 
 // ../ai_shared_src/resource-root.mts
 var resourceRoot = null;
@@ -38819,6 +37318,13 @@ var builtinSummariesText = "";
 function getJsEnv() {
   if (!jsEnv) {
     jsEnv = CS.LLMAgent.ScriptEnvBridge.CreateJavaScriptEnv();
+    const envRef = jsEnv;
+    setInterval(() => {
+      try {
+        CS.LLMAgent.ScriptEnvBridge.Tick(envRef);
+      } catch (_2) {
+      }
+    }, 20);
   }
   return jsEnv;
 }
@@ -38882,21 +37388,23 @@ To use a module, load it via ESM dynamic \`import()\`.
 **IMPORTANT**: On first use of a module, read its \`.description\` export to see detailed function signatures. After that, you already know the API \u2014 just call functions directly without re-reading \`.description\`.
 All functions validate their arguments at runtime and will throw errors if called with wrong parameters.
 
+**Examples below are illustrative only** \u2014 replace \`<module-A>\`, \`<module-B>\`, and function names with the actual modules and APIs listed in "Available modules" below.
+
 First-time usage \u2014 read description:
 \`\`\`
 async function execute() {
-    const sv = await import('${builtinPath}/scene-view.mjs');
-    return sv.description;
+    const mod = await import('${builtinPath}/<module-A>.mjs');
+    return mod.description;
 }
 \`\`\`
 
 After you know the API, call functions directly (you can combine MULTIPLE operations in one script):
 \`\`\`
 async function execute() {
-    const sv = await import('${builtinPath}/scene-view.mjs');
-    const ss = await import('${builtinPath}/screenshot.mjs');
-    sv.focusSceneViewOn('Main Camera');
-    return await ss.captureSceneView();
+    const a = await import('${builtinPath}/<module-A>.mjs');
+    const b = await import('${builtinPath}/<module-B>.mjs');
+    a.someFunction('arg');
+    return await b.anotherFunction();
 }
 \`\`\`
 
@@ -38908,33 +37416,15 @@ Available modules:
 __name(initBuiltins, "initBuiltins");
 var RUNNER_CODE = `(function(onFinish) {
     execute().then(function(result) {
-        var resultStr;
-        var imageData = null;
-        if (result === undefined) {
-            resultStr = '(no return value)';
-        } else if (result === null) {
-            resultStr = 'null';
-        } else if (typeof result === 'object') {
-            if (result.__image && result.__image.base64) {
-                imageData = { base64: result.__image.base64, mediaType: result.__image.mediaType || 'image/png' };
-                var copy = {};
-                for (var k in result) { if (k !== '__image') copy[k] = result[k]; }
-                try { resultStr = JSON.stringify(copy, null, 2); } catch(e) { resultStr = String(result); }
-            } else {
-                try { resultStr = JSON.stringify(result, null, 2); } catch(e) { resultStr = String(result); }
-            }
-        } else {
-            resultStr = String(result);
-        }
-        onFinish.Invoke(JSON.stringify({ __error: false, result: resultStr, __image: imageData }));
+        onFinish.Invoke(JSON.stringify({ __error: false, result: result }));
     }).catch(function(err) {
         onFinish.Invoke(JSON.stringify({ __error: true, message: String(err.message || err), stack: String(err.stack || '') }));
     });
 })`;
-async function executeCode(code) {
+async function executeCode(code, timeoutSeconds = 30) {
   const env = getJsEnv();
   try {
-    console.log(`[EvalCore] Executing code:
+    console.log(`[EvalCore] Executing code (timeout=${timeoutSeconds}s):
 ${code}`);
     try {
       CS.LLMAgent.ScriptEnvBridge.EvalSync(env, code);
@@ -38945,9 +37435,18 @@ ${code}`);
         stack: defineError.stack || ""
       };
     }
-    const resultJson = await new Promise((resolve2) => {
+    const executionPromise = new Promise((resolve2) => {
       CS.LLMAgent.ScriptEnvBridge.Eval(env, RUNNER_CODE, resolve2);
     });
+    const timeoutMs = timeoutSeconds * 1e3;
+    const timeoutPromise = new Promise((_2, reject) => {
+      setTimeout(() => {
+        reject(new Error(
+          `Execution timed out after ${timeoutSeconds}s. The code may be stuck (e.g. waiting for a resource that never resolves). You can retry with a longer timeout, simplify the code, or try a different approach.`
+        ));
+      }, timeoutMs);
+    });
+    const resultJson = await Promise.race([executionPromise, timeoutPromise]);
     const parsed = JSON.parse(resultJson);
     if (parsed.__error) {
       return {
@@ -38956,14 +37455,10 @@ ${code}`);
         stack: parsed.stack || ""
       };
     }
-    const output = {
+    return {
       success: true,
       result: parsed.result
     };
-    if (parsed.__image) {
-      output.__image = parsed.__image;
-    }
-    return output;
   } catch (error48) {
     const errorMsg = error48.message || String(error48);
     const stack = error48.stack || "";
@@ -38983,14 +37478,17 @@ function createEvalTools() {
      * Evaluate JavaScript code in the PuerTS runtime environment.
      */
     evalJsCode: tool({
-      description: 'Execute JavaScript code in a dedicated PuerTS runtime environment. This VM is separate from the main agent VM but is **reused across calls** \u2014 variables, functions, and state defined in previous calls persist and can be referenced in later calls.\n\nThe code runs inside Unity via PuerTS with full access to the `CS` and `puer` globals (see PuerTS interop rules and runtime environment notes in the system prompt).\n\nUse this tool when you need to inspect or modify Unity scene objects, create/destroy GameObjects or Components, query hierarchies, execute Unity API calls dynamically, or test code snippets in the live environment.\n\n**Code format**: Your code MUST be an async function declaration named `execute`, for example:\n```\nasync function execute() {\n    // your logic here\n    return someValue;\n}\n```\nUse `return <value>` inside the function to pass a result back \u2014 the returned value will appear in the `result` field of the response. If no `return` statement is used, `result` will be "(no return value)". Objects are serialized via JSON.stringify; primitives are converted to strings.\n\nOn success the response is `{ success: true, result: string }`. On failure the response is `{ success: false, error: string, stack: string }`.\n\nUse console.log() for debug output (it goes to the Unity console).' + builtinSummariesText,
+      description: 'Execute JavaScript code in a dedicated PuerTS runtime environment. This VM is separate from the main agent VM but is **reused across calls** \u2014 variables, functions, and state defined in previous calls persist and can be referenced in later calls.\n\nThe code runs inside Unity via PuerTS with full access to the `CS` and `puer` globals (see PuerTS interop rules and runtime environment notes in the system prompt).\n\nUse this tool when you need to inspect or modify Unity scene objects, create/destroy GameObjects or Components, query hierarchies, execute Unity API calls dynamically, or test code snippets in the live environment.\n\n**Code format**: Your code MUST be an async function declaration named `execute`, for example:\n```\nasync function execute() {\n    // your logic here\n    return someValue;\n}\n```\nUse `return <value>` inside the function to pass a result back \u2014 the returned value will appear in the `result` field of the response. If no `return` statement is used, `result` will be "(no return value)". You can return any value directly \u2014 objects, arrays, strings, numbers, etc. The system automatically serializes return values for you. **Do NOT call JSON.stringify() on your return value** \u2014 just return the object directly.\n\nOn success the response is `{ success: true, result: string }`. On failure the response is `{ success: false, error: string, stack: string }`.\n\nUse console.log() for debug output (it goes to the Unity console).' + builtinSummariesText,
       inputSchema: external_exports.object({
         code: external_exports.string().describe(
           "An async function declaration named `execute`. Example: \"async function execute() {\\n  const go = CS.UnityEngine.GameObject.Find('Main Camera');\\n  return go.transform.position.toString();\\n}\""
+        ),
+        timeout: external_exports.number().optional().default(30).describe(
+          "Execution timeout in seconds. Default is 30s. If the code does not finish within this time, the tool returns a timeout error. You can then decide whether to retry or take a different approach."
         )
       }),
-      execute: /* @__PURE__ */ __name(async ({ code }) => {
-        return await executeCode(code);
+      execute: /* @__PURE__ */ __name(async ({ code, timeout }) => {
+        return await executeCode(code, timeout ?? 30);
       }, "execute"),
       // Convert eval output to model-friendly content.
       // When the executed code returns an object with an __image marker
@@ -38998,17 +37496,56 @@ function createEvalTools() {
       // file-data so that handlePrepareStep can extract it and inject
       // it as a user-message image part for the LLM to see.
       toModelOutput({ output }) {
-        const textContent = output.success ? output.result : `Error: ${output.error}${output.stack ? "\nStack: " + output.stack : ""}`;
-        if (output.success && output.__image) {
+        if (!output.success) {
+          return {
+            type: "text",
+            value: `Error: ${output.error}${output.stack ? "\nStack: " + output.stack : ""}`
+          };
+        }
+        const result = output.result;
+        const images = [];
+        function collectAndStrip(obj, visited) {
+          if (!obj || typeof obj !== "object") return;
+          if (visited.has(obj)) return;
+          visited.add(obj);
+          if (obj.__image && obj.__image.base64) {
+            images.push({
+              base64: obj.__image.base64,
+              mediaType: obj.__image.mediaType || "image/png"
+            });
+            delete obj.__image;
+          }
+          for (const key of Object.keys(obj)) {
+            collectAndStrip(obj[key], visited);
+          }
+        }
+        __name(collectAndStrip, "collectAndStrip");
+        let textContent;
+        if (result === void 0) {
+          textContent = "(no return value)";
+        } else if (result === null) {
+          textContent = "null";
+        } else if (typeof result === "object") {
+          collectAndStrip(result, /* @__PURE__ */ new Set());
+          try {
+            textContent = JSON.stringify(result, null, 2);
+          } catch (_2) {
+            textContent = String(result);
+          }
+        } else {
+          textContent = String(result);
+        }
+        if (images.length > 0) {
+          console.log(`[Eval] toModelOutput: including ${images.length} image(s)`);
           return {
             type: "content",
             value: [
               { type: "text", text: textContent },
-              {
+              ...images.map((img) => ({
                 type: "file-data",
-                data: output.__image.base64,
-                mediaType: output.__image.mediaType || "image/png"
-              }
+                data: img.base64,
+                mediaType: img.mediaType
+              }))
             ]
           };
         }
@@ -39449,12 +37986,13 @@ function buildCompactionInput(messages) {
 __name(buildCompactionInput, "buildCompactionInput");
 async function compactMessages(messages, config2) {
   try {
-    const provider = createOpenAI({
+    const provider = createOpenAICompatible({
+      name: "compaction-provider",
       apiKey: config2.apiKey,
-      baseURL: config2.baseURL
+      baseURL: config2.baseURL || "https://api.openai.com/v1"
     });
     const modelId = config2.summaryModel || config2.model || "gpt-4o-mini";
-    const model = provider.chat(modelId);
+    const model = provider.chatModel(modelId);
     const conversationText = buildCompactionInput(messages);
     const result = await generateText({
       model,
@@ -39598,42 +38136,86 @@ function createToolSet() {
 }
 __name(createToolSet, "createToolSet");
 function createModel() {
-  const provider = createOpenAI({
+  const isGemini = currentConfig.model?.toLowerCase().includes("gemini");
+  const provider = createOpenAICompatible({
+    // When using Gemini, the provider name MUST be 'google' so that
+    // thought_signature round-trips correctly. The SDK stores it under
+    // providerMetadata[providerOptionsName] but the message converter
+    // reads it back from providerOptions.google — they must match.
+    name: isGemini ? "google" : "llm-provider",
     apiKey: currentConfig.apiKey,
-    baseURL: currentConfig.baseURL
+    baseURL: currentConfig.baseURL || "https://api.openai.com/v1",
+    transformRequestBody: /* @__PURE__ */ __name((body) => {
+      if (!isGemini) return body;
+      if (body.tools && Array.isArray(body.tools)) {
+        body.tools.forEach((tool2) => {
+          if (tool2.function?.parameters?.$schema) {
+            delete tool2.function.parameters.$schema;
+          }
+        });
+      }
+      return body;
+    }, "transformRequestBody")
   });
-  return provider.chat(currentConfig.model || "gpt-4o-mini");
+  return provider.chatModel(currentConfig.model || "gpt-4o-mini");
 }
 __name(createModel, "createModel");
-function handleStepFinish(onProgress, { stepNumber, text: text2, toolCalls, toolResults, finishReason }) {
+function handleStepFinish(onProgress, stepResult) {
   if (!onProgress) return;
+  const { stepNumber, text: text2, toolCalls, toolResults, finishReason } = stepResult;
+  console.log(`[Agent] Step ${stepNumber} finished: finishReason=${finishReason}, text=${text2?.length ?? 0} chars, toolCalls=${toolCalls?.length ?? 0}`);
+  if (finishReason === "length") {
+    console.warn(`[Agent] Step ${stepNumber} output was truncated (finishReason=length). The model hit max_tokens limit.`);
+    onProgress(`
+<color=#FF9800>\u26A0 Output truncated \u2014 model reached token limit.</color>
+`);
+  }
   const hasToolResults = toolResults && toolResults.length > 0;
   const hasToolCalls = toolCalls && toolCalls.length > 0;
+  const rawReasoning = stepResult.reasoning || stepResult.reasoningText;
+  if (rawReasoning) {
+    let reasoningStr;
+    if (typeof rawReasoning === "string") {
+      reasoningStr = rawReasoning;
+    } else if (Array.isArray(rawReasoning)) {
+      reasoningStr = rawReasoning.map((part) => typeof part === "string" ? part : part?.text ?? "").join("");
+    } else if (typeof rawReasoning === "object" && rawReasoning.text) {
+      reasoningStr = rawReasoning.text;
+    } else {
+      reasoningStr = JSON.stringify(rawReasoning);
+    }
+    if (reasoningStr) {
+      const truncated = reasoningStr.length > 800 ? reasoningStr.substring(0, 800) + "..." : reasoningStr;
+      onProgress(`
+<color=#B39DDB>[THINKING]</color>
+${truncated}
+`);
+    }
+  }
   let progressText = "";
   if (hasToolResults) {
     for (const tr2 of toolResults) {
       const ok = isToolResultSuccess(tr2.output);
       if (ok) {
-        progressText += `call ${tr2.toolName} <color=#4CAF50>[OK]</color>
+        progressText += `
+<color=#FFA726>[CALL]</color>  ${tr2.toolName} <color=#4CAF50>[OK]</color>
 `;
       } else {
         const errMsg = extractToolErrorMessage(tr2.output);
-        progressText += `call ${tr2.toolName} <color=#F44336>[FAIL]</color>: ${errMsg}
+        progressText += `
+<color=#FFA726>[CALL]</color>  ${tr2.toolName} <color=#F44336>[FAIL]</color>: ${errMsg}
 `;
       }
     }
   } else if (hasToolCalls) {
     for (const tc of toolCalls) {
-      progressText += `<color=#FFA726>[CALL]</color> ${tc.toolName}
+      progressText += `
+<color=#FFA726>[CALL]</color> ${tc.toolName}
 `;
     }
   }
-  if (text2 && (hasToolResults || hasToolCalls)) {
-    const truncatedText = text2.length > 500 ? text2.substring(0, 500) + "..." : text2;
-    progressText += truncatedText;
-  }
   if (progressText) {
-    onProgress(progressText.trim());
+    onProgress(progressText);
   }
 }
 __name(handleStepFinish, "handleStepFinish");
@@ -39761,12 +38343,13 @@ async function runGeneration(onProgress) {
   try {
     const model = createModel();
     const tools = createToolSet();
-    const result = await generateText({
+    const result = streamText({
       model,
       system: buildSystemPrompt(imageStore.imagePrefix),
       messages: conversationHistory,
       tools,
       abortSignal,
+      maxOutputTokens: 32768,
       // Use MAX_STEPS + 1 so the SDK does not exit the loop before our
       // prepareStep hook has a chance to inject the stop message on the
       // last allowed tool-call step.  The actual limit is enforced by
@@ -39775,10 +38358,19 @@ async function runGeneration(onProgress) {
       onStepFinish: /* @__PURE__ */ __name((stepResult) => handleStepFinish(onProgress, stepResult), "onStepFinish"),
       prepareStep: handlePrepareStep
     });
-    for (const msg of result.response.messages) {
+    let fullText = "";
+    for await (const textPart of result.textStream) {
+      fullText += textPart;
+      if (onProgress) {
+        onProgress(textPart);
+      }
+    }
+    console.log(`[Agent] textStream ended. fullText length: ${fullText.length}`);
+    const response = await result.response;
+    for (const msg of response.messages) {
       conversationHistory.push(msg);
     }
-    return result.text;
+    return fullText;
   } catch (error48) {
     if (abortSignal.aborted) {
       console.log("[Agent] Generation was aborted by user.");
@@ -39850,7 +38442,6 @@ __name(getIsConfigured, "getIsConfigured");
 
 // src/main.mts
 console.log("[Agent] LLM Agent initialized.");
-CS.LLMAgent.UnityLogBridge.StartListening();
 console.log("[Agent] LLM Agent module loaded.");
 function configureAgent(apiKey, baseURL, model, maxSteps = 0) {
   return configure({

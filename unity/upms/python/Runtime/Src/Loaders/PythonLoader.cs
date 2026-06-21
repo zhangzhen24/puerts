@@ -9,7 +9,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
 
 namespace Puerts
@@ -31,8 +30,11 @@ namespace Puerts
 
     public class NamespaceManager
     {
-        private readonly HashSet<string> _namespaces = new HashSet<string>();
-        private static readonly object _lock = new object();
+        private readonly HashSet<string> namespaces = new HashSet<string>(StringComparer.Ordinal);
+
+        private readonly Dictionary<string, TypeParameterState> typePrefixStates = new Dictionary<string, TypeParameterState>(StringComparer.Ordinal);
+
+        private readonly object @lock = new object();
 
         public NamespaceManager()
         {
@@ -42,7 +44,7 @@ namespace Puerts
 
         private void LoadNamespacesFromLoadedAssemblies()
         {
-            lock (_lock)
+            lock (@lock)
             {
                 var assemblies = AppDomain.CurrentDomain.GetAssemblies();
                 foreach (var assembly in assemblies)
@@ -54,7 +56,7 @@ namespace Puerts
 
         private void OnAssemblyLoad(object sender, AssemblyLoadEventArgs args)
         {
-            lock (_lock)
+            lock (@lock)
             {
                 AddNamespacesFromAssembly(args.LoadedAssembly);
             }
@@ -67,19 +69,16 @@ namespace Puerts
                 var types = assembly.GetTypes();
                 foreach (var type in types)
                 {
-                    if (!string.IsNullOrEmpty(type.Namespace))
-                    {
-                        _namespaces.Add(type.Namespace);
-                    }
+                    AddType(type);
                 }
             }
             catch (ReflectionTypeLoadException ex)
             {
                 foreach (var type in ex.Types)
                 {
-                    if (type != null && !string.IsNullOrEmpty(type.Namespace))
+                    if (type != null)
                     {
-                        _namespaces.Add(type.Namespace);
+                        AddType(type);
                     }
                 }
             }
@@ -89,22 +88,94 @@ namespace Puerts
             }
         }
 
-        public IEnumerable<string> GetAllNamespaces()
+        private void AddType(Type type)
         {
-            lock (_lock)
+            if (!string.IsNullOrEmpty(type.Namespace))
             {
-                return _namespaces.OrderBy(ns => ns).ToList();
+                namespaces.Add(type.Namespace);
+            }
+
+            CacheTypePrefix(type);
+        }
+
+        private void CacheTypePrefix(Type type)
+        {
+            var fullName = type.FullName;
+            if (string.IsNullOrEmpty(fullName))
+            {
+                return;
+            }
+
+            var tickIndex = fullName.IndexOf('`');
+            bool isGeneric = tickIndex >= 0;
+            var prefix = isGeneric ? fullName.Substring(0, tickIndex) : fullName;
+            if (typePrefixStates.TryGetValue(prefix, out var existingState))
+            {
+                typePrefixStates[prefix] = MergeTypeParameterState(existingState, isGeneric);
+            }
+            else
+            {
+                typePrefixStates[prefix] = isGeneric
+                    ? TypeParameterState.HasOneMoreParameter
+                    : TypeParameterState.NoParameter;
+            }
+        }
+
+        private static TypeParameterState MergeTypeParameterState(TypeParameterState existingState, bool isGeneric)
+        {
+            switch (existingState)
+            {
+                case TypeParameterState.NoType:
+                    return isGeneric ? TypeParameterState.HasOneMoreParameter : TypeParameterState.NoParameter;
+                case TypeParameterState.NoParameter:
+                    return isGeneric ? TypeParameterState.HasZeroAndMoreParameter : TypeParameterState.NoParameter;
+                case TypeParameterState.HasOneMoreParameter:
+                    return isGeneric
+                        ? TypeParameterState.HasOneMoreParameter
+                        : TypeParameterState.HasZeroAndMoreParameter;
+                case TypeParameterState.HasZeroAndMoreParameter:
+                    return TypeParameterState.HasZeroAndMoreParameter;
+                default:
+                    return existingState;
             }
         }
 
         public bool IsValidNamespace(string namespaceName)
         {
-            lock (_lock)
+            lock (@lock)
             {
-                return _namespaces.Contains(namespaceName);
+                return namespaces.Contains(namespaceName);
             }
         }
+        
+        //  2 => T<...>
+        //  1 => T, T<...>
+        //  0 => T
+        // -1 => Not exist
+        public int GetTypeParameterStateByPrefix(string typeNamePrefix)
+        {
+            if (string.IsNullOrEmpty(typeNamePrefix))
+            {
+                return (int)TypeParameterState.NoType;
+            }
+
+            lock (@lock)
+            {
+                return typePrefixStates.TryGetValue(typeNamePrefix, out var state)
+                    ? (int)state
+                    : (int)TypeParameterState.NoType;
+            }
+        }
+
+        private enum TypeParameterState
+        {
+            NoType = -1,
+            NoParameter = 0,
+            HasZeroAndMoreParameter = 1,
+            HasOneMoreParameter = 2
+        }
     }
+
 
     public class PythonDefaultLoader : PythonLoader
     {

@@ -79,7 +79,7 @@ namespace Puerts
                         var reg_api = Marshal.PtrToStructure<pesapi_reg_api>(prapi);
                         registry = reg_api.create_registry();
                         Puerts.NativeAPI.InitialPuerts(prapi, registry);
-                        extensionMethodGetMethodInfo = typeof(PuertsIl2cpp.ExtensionMethodInfo).GetMethod("Get");
+                        extensionMethodGetMethodInfo = typeof(Puerts.ExtensionMethodInfo).GetMethod("Get");
                         Puerts.NativeAPI.SetExtensionMethodGet(extensionMethodGetMethodInfo);
 
                         persistentObjectInfoType = typeof(Puerts.ScriptObject);
@@ -87,7 +87,7 @@ namespace Puerts
                         Puerts.NativeAPI.SetGlobalType_ArrayBuffer(typeof(ArrayBuffer));
                         Puerts.NativeAPI.SetGlobalType_ScriptObject(typeof(ScriptObject));
 
-                        PuertsIl2cpp.ExtensionMethodInfo.LoadExtensionMethodInfo();
+                        Puerts.ExtensionMethodInfo.LoadExtensionMethodInfo();
                         isInitialized = true;
                     }
                 }
@@ -116,7 +116,7 @@ namespace Puerts
             }
             
             var objectPoolType = typeof(PuertsIl2cpp.ObjectPool);
-            nativeScriptObjectsRefsMgr = Puerts.NativeAPI.InitialPapiEnvRef(papis, envRef, objectPool, objectPoolType.GetMethod("Add"), objectPoolType.GetMethod("Remove"));
+            nativeScriptObjectsRefsMgr = Puerts.NativeAPI.InitialPapiEnvRef(papis, envRef, this, objectPool, objectPoolType.GetMethod("Add"), objectPoolType.GetMethod("Remove"));
             
             var scope = PuertsNative.pesapi_open_scope(papis, envRef);
             var env = PuertsNative.pesapi_get_env_from_ref(papis, envRef);
@@ -183,13 +183,13 @@ namespace Puerts
         [UnityEngine.Scripting.Preserve]
         public Type GetTypeByString(string className)
         {
-            return PuertsIl2cpp.TypeUtils.GetType(className);
+            return Puerts.TypeUtils.GetType(className);
         }
         
         [UnityEngine.Scripting.Preserve]
         public void LoadAddon(string name)
         {
-            Type type = PuertsIl2cpp.TypeUtils.GetType("Puerts." + name + "Native");
+            Type type = Puerts.TypeUtils.GetType("Puerts." + name + "Native");
             type.GetMethod("Register").Invoke(null, new object[] { PuertsNative.GetRegisterApi(), registry });
         }
 
@@ -222,6 +222,7 @@ namespace Puerts
         public Action TickHandler;
         public void Tick()
         {
+            CheckLiveness();
 #if THREAD_SAFE
             lock(this) {
 #endif
@@ -276,10 +277,12 @@ namespace Puerts
             Dispose(true);
         }
 
-        private bool disposed = false;
+        internal bool disposed = false;
 
         protected virtual void Dispose(bool dispose)
         {
+            System.GC.Collect();
+            System.GC.WaitForPendingFinalizers();
             lock (this)
             {
                 if (disposed) return;
@@ -287,8 +290,7 @@ namespace Puerts
                 // void JS_FreeRuntime(JSRuntime *): assertion "list_empty(&rt->gc_obj_list)" failed in android
                 TickHandler = null;
                 moduleExecutor = null;
-                System.GC.Collect();
-                System.GC.WaitForPendingFinalizers();
+
                 Puerts.NativeAPI.CleanupPendingKillScriptObjects(nativeScriptObjectsRefsMgr);
                 
                 backend.DestroyEnvRef(envRef);
@@ -298,8 +300,18 @@ namespace Puerts
             }
             lock (scriptEnvs)
             {
+
                 scriptEnvs[Idx] = null;
             }
+        }
+
+        public bool CheckLiveness(bool shouldThrow = true)
+        {
+            if (disposed && shouldThrow)
+            {
+                throw new InvalidOperationException("JsEnv has been disposed!");
+            }
+            return !disposed;
         }
         
         public void UsingAction<T1>() { }

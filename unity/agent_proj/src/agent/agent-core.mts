@@ -2,8 +2,8 @@
  * Agent Core Module
  * Uses Vercel AI SDK to interact with LLM APIs.
  */
-import { generateText, stepCountIs, type ModelMessage } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
+import { streamText, stepCountIs, type ModelMessage } from 'ai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
 import { createEvalTools } from '../tools/eval-tool.mjs';
 import { createSkillTools } from '../tools/skill-tool.mjs';
@@ -21,14 +21,14 @@ import {
  * AbortController for the current generation.
  * Created at the start of each runGeneration() call;
  * calling abortGeneration() triggers the signal so
- * generateText stops as soon as possible.
+ * streamText stops as soon as possible.
  */
 let currentAbortController: AbortController | null = null;
 
 
 
 /**
- * Maximum number of tool-call steps allowed per generateText invocation.
+ * Maximum number of tool-call steps allowed per streamText invocation.
  * When this limit is reached, the agent is forced to produce a text-only
  * summary via an injected assistant message (à la opencode).
  * A value of 0 or negative means unlimited (capped at 9999 internally).
@@ -175,54 +175,97 @@ function createToolSet() {
  * Create an OpenAI provider and chat model from the current config.
  */
 function createModel() {
-    const provider = createOpenAI({
+    const isGemini = currentConfig.model?.toLowerCase().includes('gemini');
+    const provider = createOpenAICompatible({
+        // When using Gemini, the provider name MUST be 'google' so that
+        // thought_signature round-trips correctly. The SDK stores it under
+        // providerMetadata[providerOptionsName] but the message converter
+        // reads it back from providerOptions.google — they must match.
+        name: isGemini ? 'google' : 'llm-provider',
         apiKey: currentConfig.apiKey,
-        baseURL: currentConfig.baseURL,
+        baseURL: currentConfig.baseURL || 'https://api.openai.com/v1',
+        transformRequestBody: (body) => {
+            if (!isGemini) return body;
+            // Gemini (via proxy) rejects the $schema field in tool parameters
+            if (body.tools && Array.isArray(body.tools)) {
+                body.tools.forEach((tool: any) => {
+                    if (tool.function?.parameters?.$schema) {
+                        delete tool.function.parameters.$schema;
+                    }
+                });
+            }
+
+            return body;
+        }
     });
-    return provider.chat(currentConfig.model || 'gpt-4o-mini');
+    return provider.chatModel(currentConfig.model || 'gpt-4o-mini');
 }
 
 /**
- * onStepFinish callback for generateText.
- * Reports tool call results and intermediate text to the UI via onProgress.
+ * onStepFinish callback for streamText.
+ * Reports tool call results, reasoning/thinking content, and intermediate text to the UI via onProgress.
  */
-function handleStepFinish(onProgress: ((text: string) => void) | undefined, { stepNumber, text, toolCalls, toolResults, finishReason }: any): void {
+function handleStepFinish(onProgress: ((text: string) => void) | undefined, stepResult: any): void {
     if (!onProgress) return;
+
+    const { stepNumber, text, toolCalls, toolResults, finishReason } = stepResult;
+
+    console.log(`[Agent] Step ${stepNumber} finished: finishReason=${finishReason}, text=${text?.length ?? 0} chars, toolCalls=${toolCalls?.length ?? 0}`);
+
+    // Warn if the model output was truncated due to token limit
+    if (finishReason === 'length') {
+        console.warn(`[Agent] Step ${stepNumber} output was truncated (finishReason=length). The model hit max_tokens limit.`);
+        onProgress(`\n<color=#FF9800>⚠ Output truncated — model reached token limit.</color>\n`);
+    }
 
     const hasToolResults = toolResults && toolResults.length > 0;
     const hasToolCalls = toolCalls && toolCalls.length > 0;
+
+    // Extract reasoning/thinking content if available
+    // AI SDK may expose it via reasoning, reasoningText, or providerMetadata
+    const rawReasoning = stepResult.reasoning || stepResult.reasoningText;
+    if (rawReasoning) {
+        // reasoning may be a string, an array of {type,text} parts, or an object — normalize to string
+        let reasoningStr: string;
+        if (typeof rawReasoning === 'string') {
+            reasoningStr = rawReasoning;
+        } else if (Array.isArray(rawReasoning)) {
+            reasoningStr = rawReasoning.map((part: any) => (typeof part === 'string' ? part : part?.text ?? '')).join('');
+        } else if (typeof rawReasoning === 'object' && rawReasoning.text) {
+            reasoningStr = rawReasoning.text;
+        } else {
+            reasoningStr = JSON.stringify(rawReasoning);
+        }
+        if (reasoningStr) {
+            const truncated = reasoningStr.length > 800 ? reasoningStr.substring(0, 800) + '...' : reasoningStr;
+            onProgress(`\n<color=#B39DDB>[THINKING]</color>\n${truncated}\n`);
+        }
+    }
 
     let progressText = '';
     if (hasToolResults) {
         for (const tr of toolResults) {
             const ok = isToolResultSuccess(tr.output);
             if (ok) {
-                progressText += `call ${tr.toolName} <color=#4CAF50>[OK]</color>\n`;
+                progressText += `\n<color=#FFA726>[CALL]</color>  ${tr.toolName} <color=#4CAF50>[OK]</color>\n`;
             } else {
                 const errMsg = extractToolErrorMessage(tr.output);
-                progressText += `call ${tr.toolName} <color=#F44336>[FAIL]</color>: ${errMsg}\n`;
+                progressText += `\n<color=#FFA726>[CALL]</color>  ${tr.toolName} <color=#F44336>[FAIL]</color>: ${errMsg}\n`;
             }
         }
     } else if (hasToolCalls) {
         for (const tc of toolCalls) {
-            progressText += `<color=#FFA726>[CALL]</color> ${tc.toolName}\n`;
+            progressText += `\n<color=#FFA726>[CALL]</color> ${tc.toolName}\n`;
         }
     }
 
-    // Only include intermediate text when it accompanies tool calls.
-    // If a step is pure text with no tool calls (i.e. the final response),
-    // skip it here — it will be shown via FinalizeProgressBubble's finalText.
-    if (text && (hasToolResults || hasToolCalls)) {
-        const truncatedText = text.length > 500 ? text.substring(0, 500) + '...' : text;
-        progressText += truncatedText;
-    }
     if (progressText) {
-        onProgress(progressText.trim());
+        onProgress(progressText);
     }
 }
 
 /**
- * prepareStep callback for generateText.
+ * prepareStep callback for streamText.
  * Handles big-string compression, sliding-window trimming,
  * and screenshot image extraction.
  */
@@ -394,7 +437,7 @@ async function prepareHistory(): Promise<void> {
 
 /**
  * Core generation logic shared by sendMessage.
- * Calls generateText, appends response messages to history, handles errors.
+ * Calls streamText, appends response messages to history, handles errors.
  *
  * @param onProgress  Optional progress callback for the UI.
  * @returns The assistant's text response.
@@ -408,12 +451,13 @@ async function runGeneration(onProgress?: (text: string) => void): Promise<strin
         const model = createModel();
         const tools = createToolSet();
 
-        const result = await generateText({
+        const result = streamText({
             model,
             system: buildSystemPrompt(imageStore.imagePrefix),
             messages: conversationHistory,
             tools,
             abortSignal,
+            maxOutputTokens: 32768,
             // Use MAX_STEPS + 1 so the SDK does not exit the loop before our
             // prepareStep hook has a chance to inject the stop message on the
             // last allowed tool-call step.  The actual limit is enforced by
@@ -423,12 +467,23 @@ async function runGeneration(onProgress?: (text: string) => void): Promise<strin
             prepareStep: handlePrepareStep,
         });
 
+        let fullText = '';
+        for await (const textPart of result.textStream) {
+            fullText += textPart;
+            if (onProgress) {
+                onProgress(textPart);
+            }
+        }
+
+        console.log(`[Agent] textStream ended. fullText length: ${fullText.length}`);
+
         // Append all response messages (assistant + tool) to conversation history
-        for (const msg of result.response.messages) {
+        const response = await result.response;
+        for (const msg of response.messages) {
             conversationHistory.push(msg as ModelMessage);
         }
 
-        return result.text;
+        return fullText;
     } catch (error: any) {
         // Check if the error is an abort
         if (abortSignal.aborted) {
